@@ -122,6 +122,24 @@ class Analysis(unittest.TestCase):
         self.assertEqual(found["pmids"], ["19043405", "22948816"])
         self.assertEqual(len(found["dois"]), 1)
 
+    def test_bullet_under_candidate_heading_is_checked_against_it(self):
+        # Observed 2026-10-23: DeepSeek cited the miR-495-3p paper on a
+        # "Cell lines studied" bullet under "#### miR-495-3p". The bullet alone
+        # named only "DIC", which was read as a gene, so a correct citation was
+        # reported as about "DIC" while the paper concerned "AKT, PTEN".
+        answer = ("#### miR-495-3p\n- **Regulatory axis**: Activates AKT signaling.\n"
+                  "- **Cell lines studied**: Not detailed in abstract; DIC model [PMID: 35152537]\n")
+        paper = {"title": "MicroRNA-495-3p diminishes doxorubicin-induced cardiotoxicity "
+                          "through activating AKT.",
+                 "abstract": "miR-495-3p directly bound to the 3'UTR of PTEN and activated AKT."}
+        ctx = lit._claim_context(answer, "35152537")
+        self.assertIn("miR-495-3p", ctx)
+        self.assertEqual(lit.assess_citation_support(ctx, paper)["support"], "supported")
+
+    def test_disease_and_cell_line_abbreviations_are_not_genes(self):
+        self.assertEqual(lit._targets("DIC model in AC16 cells; DOX; iPSC-MSCs, BMSC EVs"), set())
+        self.assertEqual(lit._targets("HMGB1 and PTEN"), {"HMGB1", "PTEN"})
+
     def test_parse_models_default_and_unknown(self):
         with unittest.mock.patch.object(models, "available", return_value=True):
             self.assertEqual(cli.parse_models("default"), list(models.SITE_DEFAULT))

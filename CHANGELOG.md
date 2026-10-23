@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3 — 2026-10-23
+
+### Fixed
+- Correct citations were reported as off-topic when cited on a detail bullet ("Cell lines
+  studied: … DIC model [PMID]") under a candidate heading ("#### miR-495-3p"). The bullet named no
+  RNA, and "DIC" (doxorubicin-induced cardiotoxicity) was read as a gene symbol. The heading is
+  now part of the claim, and disease, drug, cell-type and cell-line abbreviations (DIC, DOX, MSC,
+  EVs, AC16, H9C2…) are no longer treated as genes. Checker version 4: saved results are re-checked.
+
 ## 0.2.2 — 2026-10-23
 
 ### Fixed
