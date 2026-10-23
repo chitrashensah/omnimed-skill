@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 — 2026-10-23
+
+### Fixed
+- An unreachable literature database (offline, or a sandbox that blocks PubMed) no longer looks
+  like "no papers exist". `search` now fails with `LITERATURE_UNREACHABLE`; with `--db`, the answer
+  is labelled "literature search failed" and the model is not told that nothing was found. Results
+  with an unreachable source are listed in `unavailable` and are not cached.
+
 ## 0.2.0 — 2026-10-23
 
 ### Added

@@ -304,6 +304,43 @@ class Report(unittest.TestCase):
         self.assertNotIn("\n## Candidates\n", md)
 
 
+@unittest.skipUnless(HAVE_HTTPX, "needs httpx")
+class Unreachable(unittest.TestCase):
+    """A database that cannot be reached must not look like 'no papers exist'."""
+
+    def _down(self):
+        async def down(*a, **k):
+            raise lit.httpx.ConnectError("blocked")
+        return unittest.mock.patch.multiple(lit, search_pubmed=down, search_europepmc=down, search_trials=down)
+
+    def test_search_reports_unavailable_and_does_not_cache(self):
+        q = "unreachable test %s" % os.getpid()
+        with self._down(), unittest.mock.patch.object(lit, "_cache_put") as put:
+            res = asyncio.run(lit.search(q, sources=("pubmed",)))
+        self.assertEqual(res["unavailable"], ["pubmed"])
+        put.assert_not_called()
+
+    def test_cli_search_fails_loudly(self):
+        import argparse
+        args = argparse.Namespace(query="miR-21 fibrosis %s" % os.getpid(), sources=None, limit=5,
+                                  year_from=None, year_to=None, abstract_chars=600)
+        out = io.StringIO()
+        with self._down(), contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            cli.cmd_search(args)
+        self.assertEqual(json.loads(out.getvalue())["error"], "LITERATURE_UNREACHABLE")
+
+    def test_grounding_marks_failed_search(self):
+        litmap = grounding.parse_literature({"m": {"db": "pubmed", "dates": "5y", "papers": "auto"}}, ["m"])
+
+        async def go():
+            search_for = grounding.literature_searcher("miR-21 in cardiac fibrosis", litmap)
+            return await grounding.grounded_message("m", "miR-21 in cardiac fibrosis", litmap, search_for)
+        with self._down():
+            msg, given = asyncio.run(go())
+        self.assertEqual(given.get("error"), "SEARCH_FAILED")
+        self.assertNotIn("found no papers", msg)
+
+
 @unittest.skipUnless(HAVE_HTTPX and os.getenv("OMNIMED_LIVE"), "set OMNIMED_LIVE=1 for PubMed checks")
 class LivePubMed(unittest.TestCase):
     def test_fake_pmid_and_miscitation_are_caught(self):

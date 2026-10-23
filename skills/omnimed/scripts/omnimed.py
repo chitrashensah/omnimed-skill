@@ -288,6 +288,9 @@ def cmd_search(args):
     sources = tuple(s for s in (args.sources or ",".join(lit.SOURCES)).split(",") if s in lit.SOURCES)
     res = asyncio.run(lit.search(args.query, sources=sources or lit.SOURCES, limit=args.limit,
                                  year_from=args.year_from, year_to=args.year_to))
+    if res.get("unavailable") and len(res["unavailable"]) == len(res.get("by_source") or {}):
+        fail("LITERATURE_UNREACHABLE", f"Could not reach {', '.join(res['unavailable'])}; "
+             "this is a network problem, not an empty result.")
     for p in res.get("papers", []):
         p["abstract"] = (p.get("abstract") or "")[:args.abstract_chars]
     emit({"status": "ok", **res})

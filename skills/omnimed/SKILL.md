@@ -230,6 +230,7 @@ it that.
 | `TRUNCATED_BEFORE_ANSWER` | Model spent its whole budget thinking |
 | `NETWORK_ERROR` | Connection dropped (already retried once); retrying usually works |
 | `TIMEOUT` | No answer within 5 minutes |
+| `LITERATURE_UNREACHABLE` | No literature database could be reached (offline, or a sandbox that blocks them). Say so; never report it as "no papers found". With `--db`, an unreachable database shows as "literature search failed" on that answer |
 | `TOO_MANY_MODELS` | More than 5 in one comparison; ask which to drop |
 
 ## Setup problems
