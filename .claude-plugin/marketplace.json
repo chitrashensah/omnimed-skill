@@ -1,0 +1,15 @@
+{
+  "name": "omnimed",
+  "owner": {
+    "name": "Chitrashen Sah",
+    "email": "chitrashenshah@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "omnimed",
+      "source": "./",
+      "description": "Compare AI models on cardiovascular ncRNA questions, ground them in PubMed or Europe PMC, and verify every citation."
+    }
+  ],
+  "description": "OmniMed: multi-model comparison, literature grounding and citation verification for cardiovascular ncRNA research."
+}

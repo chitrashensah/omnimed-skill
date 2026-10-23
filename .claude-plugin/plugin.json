@@ -1,0 +1,13 @@
+{
+  "name": "omnimed",
+  "version": "0.2.0",
+  "description": "Compare AI models on cardiovascular ncRNA research questions, ground them in PubMed or Europe PMC papers, verify every citation (including open full text), and profile candidates against the literature and clinical trials.",
+  "author": {
+    "name": "Chitrashen Sah",
+    "email": "chitrashenshah@gmail.com"
+  },
+  "homepage": "https://omni--med.vercel.app",
+  "repository": "https://github.com/chitrashensah/omnimed-skill",
+  "license": "MIT",
+  "keywords": ["biomedical", "microRNA", "ncRNA", "cardiovascular", "PubMed", "citation-verification", "multi-llm"]
+}
