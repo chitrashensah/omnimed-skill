@@ -97,7 +97,7 @@ citations and uncited claims, profiles candidates, and judges each answer.
 It typically takes 2–4 minutes; the slowest model sets the pace. Tell the user
 it is running, and use a long timeout (10 minutes).
 
-### 5. Write the verdict and open the browser view
+### 5. Write the verdict and show the conversation view
 
 Read `report.md` from the run directory, then write a short verdict
 (3–6 sentences or bullets) to a file. It is the conclusion comparing the
@@ -115,15 +115,21 @@ cited papers (the checker does that; open papers only if the user asks):
 - If a date range was set, mention any citation the report flags as older than it.
 - If your own answer is in the comparison, say so and do not rank it above the others.
 
-Then:
+Then put it in the **Conclusion** box and show the conversation view: the
+website's layout, each model in its own coloured box with badges for citations
+and judge score, problems highlighted, every answer in full. Follow-ups are
+added to the same page (earlier questions collapsed), like the website's chat.
 
-```bash
-python3 scripts/omnimed.py add-verdict <run> <verdict-file>
-```
-
-This puts the verdict in the **Conclusion** box and opens `report.html` in the
-browser: the website's layout, with each model in its own coloured box, badges
-for citations and judge score, problems highlighted, and every answer in full.
+- **If you have an Artifact tool** (the Claude desktop app), show it beside the
+  chat, not in a separate browser:
+  ```bash
+  python3 scripts/omnimed.py add-verdict <run> <verdict-file> --no-open
+  ```
+  then publish the `conversation_html` path it prints as an artifact (icon
+  `chart`). It is one file per conversation, so for a follow-up publish the
+  same path again: the same panel updates instead of a new one opening.
+- **Otherwise** (terminal): `add-verdict <run> <verdict-file>` opens it in the
+  default browser.
 
 ### 6. Present in chat
 
@@ -132,9 +138,9 @@ Show, in this order:
 1. Your verdict.
 2. The **Scoreboard** table from `report.md`, exactly as written.
 3. Problems, one line per model (e.g. "GPT-OSS: 1 off-topic citation"). The
-   details are in the browser view.
-4. One line: the side-by-side answers are open in the browser (give the
-   `report_html` path); you can paste any answer or the candidates table on request.
+   details are in the conversation view.
+4. One line: the side-by-side answers are in the conversation view (beside the
+   chat, or in the browser); you can paste any answer or the candidates table on request.
 
 Then stop. Do not start other work in the same turn: no re-checking papers by
 hand, no changes to OmniMed's code, no commits. If a result looks wrong (say, a
@@ -142,8 +148,8 @@ citation flagged off-topic that seems on-topic), say so in one line and let the
 user decide.
 
 Never summarise or paraphrase a model's answer in place of showing it. If the
-browser did not open (`opened_in_browser: false`) or the user prefers the chat,
-show every answer in full under its model name instead.
+view could not be shown (no artifact, `opened_in_browser: false`) or the user
+prefers the chat, show every answer in full under its model name instead.
 
 End by asking if they want to swap any models, and mention that wet-lab results
 can be recorded on the OmniMed website.
@@ -159,7 +165,8 @@ python3 scripts/omnimed.py run "<follow-up>" --models <same models> --after <pre
 
 Each model gets **its own** earlier questions and answers as history, never
 another model's, so the answers stay independent. A model that was not in the
-earlier run is told the earlier questions only. Then present as in steps 5–6.
+earlier run is told the earlier questions only. Then present as in steps 5–6;
+`conversation_html` is the same file as before, now with this question added.
 
 ## Switching models
 

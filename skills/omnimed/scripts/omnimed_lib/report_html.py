@@ -1,4 +1,7 @@
 # The browser view of a comparison: the website's layout, as one local file.
+# A conversation (a run and its follow-ups, `--after`) is one page: each turn's
+# question, scoreboard and model boxes in order, earlier turns collapsed, like
+# the website's chat.
 #
 # Boxes, colours, fonts and the grid rule are taken from the OmniMed site
 # (omnimed-frontend: index.css variables, Chat.css .mbox, gridCols()), so a run
@@ -64,11 +67,16 @@ def _payload(comp: dict) -> dict:
             "candidates": comp.get("candidates") or [], "verdict": comp.get("verdict")}
 
 
-def render(comp: dict) -> str:
-    data = json.dumps(_payload(comp), ensure_ascii=False).replace("</", "<\\/")
-    title = "OmniMed comparison"
-    return _TEMPLATE.replace("__DATA__", data).replace("__TITLE__", title) \
+def render_conversation(comps: list[dict]) -> str:
+    """One page for a whole conversation, oldest turn first."""
+    data = json.dumps({"turns": [_payload(c) for c in comps]},
+                      ensure_ascii=False).replace("</", "<\\/")
+    return _TEMPLATE.replace("__DATA__", data).replace("__TITLE__", "OmniMed comparison") \
                     .replace("__MARKED__", MARKED).replace("__PURIFY__", PURIFY)
+
+
+def render(comp: dict) -> str:
+    return render_conversation([comp])
 
 
 _TEMPLATE = r"""<!doctype html>
@@ -92,12 +100,18 @@ _TEMPLATE = r"""<!doctype html>
   --font-mono: 'JetBrains Mono', ui-monospace, monospace;
 }
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #0d0d10; --bg-secondary: #17171c; --surface: #17171c; --border: rgba(255,255,255,0.1);
     --text: #f0f0f2; --text-muted: #93939f; --panel-bg: #141418; --panel-border: rgba(255,255,255,0.08);
     --pale-green: #0f2a22; --pale-blue: #131a2b; --primary: #f0f0f2;
     --bad: #fda29b; --bad-bg: #2b1513; --warn: #fec84b; --warn-bg: #2a2111; --ok: #75e0a7; --ok-bg: #0f2a1d;
   }
+}
+:root[data-theme="dark"] {
+  --bg: #0d0d10; --bg-secondary: #17171c; --surface: #17171c; --border: rgba(255,255,255,0.1);
+  --text: #f0f0f2; --text-muted: #93939f; --panel-bg: #141418; --panel-border: rgba(255,255,255,0.08);
+  --pale-green: #0f2a22; --pale-blue: #131a2b; --primary: #f0f0f2;
+  --bad: #fda29b; --bad-bg: #2b1513; --warn: #fec84b; --warn-bg: #2a2111; --ok: #75e0a7; --ok-bg: #0f2a1d;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--font-body); font-size: 14px; line-height: 1.55; }
@@ -147,6 +161,15 @@ th { font-weight: 600; color: var(--text-muted); font-size: 12px; }
 .conclusion .mbadge { background: var(--coral); color: #fff; border: none; }
 .empty { color: var(--text-slate); font-style: italic; }
 a { color: var(--action-blue); }
+.turn { display: flex; flex-direction: column; gap: 12px; }
+.turn + .turn { border-top: 1px solid var(--border); padding-top: 16px; }
+.turn > summary, .turn-head { cursor: pointer; list-style: none; }
+.turn-head { cursor: default; }
+.turn-q { font-family: var(--font-display); font-weight: 600; font-size: 18px; line-height: 1.35; margin: 2px 0; }
+.turn-n { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--coral); }
+details.turn:not([open]) > summary .turn-q { font-size: 15px; color: var(--text-muted); }
+details.turn > summary .turn-q::after { content: ' · show'; color: var(--text-slate); font-size: 12px; font-weight: 400; }
+details.turn[open] > summary .turn-q::after { content: ' · hide'; }
 </style>
 </head>
 <body>
@@ -159,17 +182,7 @@ a { color: var(--action-blue); }
   <div class="toolbar">
     <button class="btn" id="expand" type="button">Expand all answers</button>
   </div>
-  <details class="panel" open>
-    <summary>Scoreboard</summary>
-    <div class="tablewrap"><table id="score"></table></div>
-    <p class="note">Citation columns come from PubMed, Crossref and DataCite lookups: deterministic, no AI. The judge score is one model's rubric opinion, always from a different provider than the answer, blinded to who wrote it. It is noisy. Wet-lab results are the ground truth.</p>
-  </details>
-  <details class="panel" open>
-    <summary>Candidates, checked against the literature</summary>
-    <div class="tablewrap"><table id="cands"></table></div>
-    <p class="note">Counts come from PubMed and ClinicalTrials.gov, not from the answers. Many models naming a candidate is weak evidence on its own.</p>
-  </details>
-  <div class="grid" id="grid"></div>
+  <div id="turns"></div>
 </main>
 <script type="application/json" id="data">__DATA__</script>
 <script src="__MARKED__"></script>
@@ -201,48 +214,74 @@ a { color: var(--action-blue); }
   // Same rule as the site's gridCols(): keeps boxes wide enough to read.
   function gridCols(total) { return total <= 2 ? total : (total <= 4 ? 2 : 3); }
 
-  document.getElementById('q').textContent = D.question;
-  var okCount = D.answers.filter(function (a) { return a.status === 'ok'; }).length;
+  var T = D.turns || [];
+  var first = T[0] || {question: '', answers: []}, last = T[T.length - 1] || first;
+  document.getElementById('q').textContent = first.question;
   document.getElementById('meta').textContent =
-    D.answers.length + ' models (' + okCount + ' answered) · run ' + D.run_id + (D.created ? ' · ' + D.created.replace('T', ' ').slice(0, 16) + ' UTC' : '');
-  document.title = 'OmniMed · ' + D.question.slice(0, 60);
+    (T.length > 1 ? T.length + ' questions · ' : '') + last.answers.length + ' models' +
+    (last.created ? ' · updated ' + last.created.replace('T', ' ').slice(0, 16) + ' UTC' : '');
+  document.title = 'OmniMed · ' + first.question.slice(0, 60);
 
-  // Scoreboard
-  var score = document.getElementById('score');
-  row(score, ['Model', 'Citations real', 'Fabricated', 'Off-topic', 'Retracted', 'Uncited claims w/o literature', 'Judge', 'Time'], true);
-  D.answers.forEach(function (a) {
-    var c = a.cites || {}, ok = a.status === 'ok', has = ok && c.checked;
-    row(score, [
-      a.label,
-      !ok ? 'failed: ' + a.error : (c.checked ? c.verified + ' / ' + c.checked : 'none cited'),
-      has ? String(c.fabricated) : '—', has ? String(c.mismatched) : '—', has ? String(c.retracted || 0) : '—',
-      ok && a.unsourced && a.unsourced.checked ? a.unsourced.none_found + ' of ' + a.unsourced.checked : '—',
-      ok && a.judge && a.judge.overall ? a.judge.overall + '/10' : '—',
-      a.seconds ? a.seconds + 's' : '—'
-    ]);
-  });
-
-  // Candidates
-  var cands = document.getElementById('cands');
-  var labels = {};
-  D.answers.forEach(function (a) { labels[a.model] = a.label; });
-  if (!D.candidates.length) {
-    cands.appendChild(el('caption', 'empty', 'No miRNA/lncRNA candidates were named.'));
-  } else {
-    row(cands, ['Candidate', 'Named by', 'PubMed papers', 'Since 2021', 'Trials (as intervention)'], true);
-    D.candidates.forEach(function (p) {
-      row(cands, [p.name, (p.proposed_by || []).map(function (m) { return labels[m] || m; }).join(', '),
-        p.papers == null ? 'lookup failed' : String(p.papers),
-        p.papers_recent == null ? '—' : String(p.papers_recent),
-        p.trials == null ? 'lookup failed' : String(p.trials)]);
-    });
+  function panel(title, open, note) {
+    var d = el('details', 'panel'); d.open = open;
+    d.appendChild(el('summary', null, title));
+    var wrap = el('div', 'tablewrap'), table = el('table');
+    wrap.appendChild(table); d.appendChild(wrap);
+    if (note) d.appendChild(el('p', 'note', note));
+    return {node: d, table: table};
   }
 
-  // Model boxes + conclusion, laid out like the site
-  var grid = document.getElementById('grid');
-  grid.style.setProperty('--cols', gridCols(D.answers.length + 1));
+  function drawTurn(t, n, isLast) {
+    var turn = el(isLast ? 'section' : 'details', 'turn');
+    var head = el(isLast ? 'div' : 'summary', isLast ? 'turn-head' : null);
+    head.appendChild(el('div', 'turn-n', T.length > 1 ? 'Question ' + n : 'Question'));
+    head.appendChild(el('div', 'turn-q', t.question));
+    turn.appendChild(head);
 
-  D.answers.forEach(function (a) {
+    // Scoreboard
+    var sp = panel('Scoreboard', isLast, 'Citation columns come from PubMed, Crossref and DataCite lookups: deterministic, no AI. The judge score is one model\'s rubric opinion, always from a different provider than the answer, blinded to who wrote it. It is noisy. Wet-lab results are the ground truth.');
+    var score = sp.table;
+    row(score, ['Model', 'Citations real', 'Fabricated', 'Off-topic', 'Retracted', 'Uncited claims w/o literature', 'Judge', 'Time'], true);
+    t.answers.forEach(function (a) {
+      var c = a.cites || {}, ok = a.status === 'ok', has = ok && c.checked;
+      row(score, [
+        a.label,
+        !ok ? 'failed: ' + a.error : (c.checked ? c.verified + ' / ' + c.checked : 'none cited'),
+        has ? String(c.fabricated) : '—', has ? String(c.mismatched) : '—', has ? String(c.retracted || 0) : '—',
+        ok && a.unsourced && a.unsourced.checked ? a.unsourced.none_found + ' of ' + a.unsourced.checked : '—',
+        ok && a.judge && a.judge.overall ? a.judge.overall + '/10' : '—',
+        a.seconds ? a.seconds + 's' : '—'
+      ]);
+    });
+    turn.appendChild(sp.node);
+
+    // Candidates
+    var cp = panel('Candidates, checked against the literature', false, 'Counts come from PubMed and ClinicalTrials.gov, not from the answers. Many models naming a candidate is weak evidence on its own.');
+    var cands = cp.table, labels = {};
+    t.answers.forEach(function (a) { labels[a.model] = a.label; });
+    if (!t.candidates.length) {
+      cands.appendChild(el('caption', 'empty', 'No miRNA/lncRNA candidates were named.'));
+    } else {
+      row(cands, ['Candidate', 'Named by', 'PubMed papers', 'Since 2021', 'Trials (as intervention)'], true);
+      t.candidates.forEach(function (p) {
+        row(cands, [p.name, (p.proposed_by || []).map(function (m) { return labels[m] || m; }).join(', '),
+          p.papers == null ? 'lookup failed' : String(p.papers),
+          p.papers_recent == null ? '—' : String(p.papers_recent),
+          p.trials == null ? 'lookup failed' : String(p.trials)]);
+      });
+    }
+    turn.appendChild(cp.node);
+
+    // Model boxes + conclusion, laid out like the site
+    var grid = el('div', 'grid');
+    grid.style.setProperty('--cols', gridCols(t.answers.length + 1));
+    t.answers.forEach(function (a) { grid.appendChild(drawBox(a)); });
+    grid.appendChild(drawConclusion(t.verdict));
+    turn.appendChild(grid);
+    return turn;
+  }
+
+  function drawBox(a) {
     var box = el('section', 'mbox');
     var head = el('div', 'mbox-head');
     head.style.borderBottomColor = a.color;
@@ -257,8 +296,7 @@ a { color: var(--action-blue); }
     if (a.status !== 'ok') {
       box.appendChild(el('div', 'failed', 'No answer: ' + a.error));
       if (a.detail) box.appendChild(el('div', 'mjudge', a.detail));
-      grid.appendChild(box);
-      return;
+      return box;
     }
 
     var chips = el('div', 'chips'), c = a.cites || {};
@@ -307,24 +345,30 @@ a { color: var(--action-blue); }
     } else if (a.judge && a.judge.error) {
       box.appendChild(el('div', 'mjudge', 'Not scored: ' + a.judge.error));
     }
-    grid.appendChild(box);
-  });
+    return box;
+  }
 
-  var concl = el('section', 'mbox conclusion');
-  var ch = el('div', 'mbox-head');
-  ch.appendChild(el('span', 'mbadge', 'Conclusion'));
-  if (D.verdict && D.verdict.by) ch.appendChild(el('span', 'mtime', 'by ' + D.verdict.by));
-  concl.appendChild(ch);
-  var cbody = el('div', 'mbody');
-  if (D.verdict && D.verdict.text) md(cbody, D.verdict.text);
-  else cbody.appendChild(el('p', 'empty', 'No verdict yet. Ask Claude for its conclusion on this comparison.'));
-  concl.appendChild(cbody);
-  grid.appendChild(concl);
+
+  function drawConclusion(verdict) {
+    var concl = el('section', 'mbox conclusion');
+    var ch = el('div', 'mbox-head');
+    ch.appendChild(el('span', 'mbadge', 'Conclusion'));
+    if (verdict && verdict.by) ch.appendChild(el('span', 'mtime', 'by ' + verdict.by));
+    concl.appendChild(ch);
+    var cbody = el('div', 'mbody');
+    if (verdict && verdict.text) md(cbody, verdict.text);
+    else cbody.appendChild(el('p', 'empty', 'No verdict yet. Ask Claude for its conclusion on this comparison.'));
+    concl.appendChild(cbody);
+    return concl;
+  }
+
+  var turns = document.getElementById('turns');
+  T.forEach(function (t, i) { turns.appendChild(drawTurn(t, i + 1, i === T.length - 1)); });
 
   var expanded = false;
   document.getElementById('expand').addEventListener('click', function () {
     expanded = !expanded;
-    grid.classList.toggle('expanded', expanded);
+    document.querySelectorAll('.grid').forEach(function (g) { g.classList.toggle('expanded', expanded); });
     this.textContent = expanded ? 'Collapse answers' : 'Expand all answers';
   });
 })();

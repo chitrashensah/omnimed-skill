@@ -215,20 +215,42 @@ def write_run_meta(run: Path, **fields):
     (run / "run.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
-def history_chain(run: Path | None, depth: int = 6) -> list[tuple[str, dict]]:
-    """Earlier turns of a conversation, oldest first: (question, {model: answer}).
+def run_chain(run: Path | None, depth: int = 6) -> list[Path]:
+    """The runs of a conversation up to and including `run`, oldest first.
 
     A follow-up run records the run it follows (`--after`), so a conversation
-    is a chain of runs. Six turns back at most, like the website.
+    is a chain of runs.
     """
     chain, seen = [], set()
     while run and len(chain) < depth and str(run) not in seen:
         seen.add(str(run))
-        question, answers = load_run(run)
-        chain.append((question, {a["model"]: a for a in answers}))
+        chain.append(run)
         after = run_meta(run).get("after")
         run = Path(after) if after else None
     return list(reversed(chain))
+
+
+def history_chain(run: Path | None, depth: int = 6) -> list[tuple[str, dict]]:
+    """Earlier turns of a conversation, oldest first: (question, {model: answer}).
+    Six turns back at most, like the website."""
+    turns = []
+    for r in run_chain(run, depth):
+        question, answers = load_run(r)
+        turns.append((question, {a["model"]: a for a in answers}))
+    return turns
+
+
+CONVERSATION_TURNS = 20
+
+
+def write_conversation(run: Path) -> Path:
+    """The whole conversation as one page, kept in its first run's directory,
+    so every follow-up updates the same file (and the same in-app view)."""
+    chain = run_chain(run, CONVERSATION_TURNS)
+    comps = [c for c in (_previous(r) for r in chain) if c]
+    page = chain[0] / "conversation.html"
+    page.write_text(report_html.render_conversation(comps), encoding="utf-8")
+    return page
 
 
 # ── Commands ────────────────────────────────────────────────────────────────
@@ -506,6 +528,7 @@ def _write_comparison(run: Path, comp: dict) -> dict:
     md = report.render(comp)
     (run / "report.md").write_text(md, encoding="utf-8")
     (run / "report.html").write_text(report_html.render(comp), encoding="utf-8")
+    conversation = write_conversation(run)
 
     summary = []
     for a in comp["answers"]:
@@ -525,6 +548,7 @@ def _write_comparison(run: Path, comp: dict) -> dict:
         })
     return {"status": "ok", "run": str(run), "report": str(run / "report.md"),
             "report_html": str(run / "report.html"),
+            "conversation_html": str(conversation),
             "comparison_json": str(run / "comparison.json"),
             "candidates": [{"name": p.get("name"), "named_by": p.get("proposed_by"),
                             "papers": p.get("papers"), "papers_recent": p.get("papers_recent"),
@@ -551,7 +575,7 @@ def open_in_browser(path: Path) -> bool:
 def _finish(run: Path, comp: dict, want_open: bool):
     out = _write_comparison(run, comp)
     if want_open:
-        out["opened_in_browser"] = open_in_browser(run / "report.html")
+        out["opened_in_browser"] = open_in_browser(Path(out["conversation_html"]))
     emit(out)
 
 
@@ -588,17 +612,19 @@ def cmd_add_verdict(args):
                                          encoding="utf-8")
     (run / "report.md").write_text(report.render(comp), encoding="utf-8")
     (run / "report.html").write_text(report_html.render(comp), encoding="utf-8")
-    out = {"status": "ok", "run": str(run), "report_html": str(run / "report.html")}
+    conversation = write_conversation(run)
+    out = {"status": "ok", "run": str(run), "report_html": str(run / "report.html"),
+           "conversation_html": str(conversation)}
     if not args.no_open:
-        out["opened_in_browser"] = open_in_browser(run / "report.html")
+        out["opened_in_browser"] = open_in_browser(conversation)
     emit(out)
 
 
 def cmd_open(args):
     run = Path(args.run).expanduser()
-    page = run / "report.html"
-    if not page.exists():
+    if not (run / "report.html").exists():
         fail("NO_REPORT", f"No report.html in {run}; run `compare` first.")
+    page = write_conversation(run)
     emit({"status": "ok", "report_html": str(page), "opened_in_browser": open_in_browser(page)})
 
 
@@ -680,7 +706,7 @@ def main():
     p.add_argument("--no-open", action="store_true")
     p.set_defaults(fn=cmd_add_verdict)
 
-    p = sub.add_parser("open", help="open a run's report.html in the browser")
+    p = sub.add_parser("open", help="open the conversation view (all turns) in the browser")
     p.add_argument("run")
     p.set_defaults(fn=cmd_open)
 

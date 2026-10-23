@@ -84,4 +84,5 @@ why the three are never merged.
 - `answers/<model>.md`: each answer as written; `answers/<model>.json`: status, served model id, tokens, time
 - `comparison.json`: everything, machine-readable
 - `report.md`: the human-readable report
-- `report.html`: the browser view, laid out like the website (one box per model, Conclusion box)
+- `report.html`: this question's view, laid out like the website (one box per model, Conclusion box)
+- `conversation.html` (in the first run of a conversation): every question and its answers on one page; this is what is shown beside the chat or in the browser

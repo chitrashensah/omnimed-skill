@@ -9,6 +9,12 @@
   now part of the claim, and disease, drug, cell-type and cell-line abbreviations (DIC, DOX, MSC,
   EVs, AC16, H9C2…) are no longer treated as genes. Checker version 4: saved results are re-checked.
 
+### Added
+- **Conversation view.** A follow-up adds to the same page (`conversation.html` in the first run),
+  earlier questions collapsed, like the website's chat. In the Claude app it is shown as an
+  artifact beside the chat and updated in place on each follow-up; from the terminal it opens in
+  the browser. `open <run>` opens it.
+
 ### Changed
 - After a comparison, Claude shows a short conclusion, the scoreboard and one line of problems per
   model, then stops; the answers are in the browser view. It no longer re-reviews papers by hand,

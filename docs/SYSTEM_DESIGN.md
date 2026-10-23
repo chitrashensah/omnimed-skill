@@ -90,7 +90,7 @@ sequenceDiagram
     O->>J: one blinded rubric call per answer (judge ≠ its provider)
     O-->>C: JSON: scoreboard, candidates, report paths
     C->>C: read report.md, write verdict
-    C->>O: add-verdict → report.html opens
+    C->>O: add-verdict → conversation.html (artifact beside the chat, or browser)
 ```
 
 What each model receives, and when, is decided by the shared `grounding.py`,
@@ -139,7 +139,8 @@ The same three layers as the website, kept in separate fields:
 ├── answers/<model>.json status, served model id, tokens, time, papers given
 ├── comparison.json     checks, scores, candidates, verdict (machine-readable)
 ├── report.md           the report Claude reads and shows
-└── report.html         the browser view
+├── report.html         this question's view
+└── conversation.html   (first run only) every question of the conversation on one page
 ```
 
 A conversation is a chain of runs linked by `run.json → after`. Swapping a model
@@ -155,7 +156,7 @@ version), so only the new model is asked, checked and scored.
 | API keys | Read from `~/.config/omnimed/*.env` or `OMNIMED_ENV_FILE`, never from the skill folder; never printed (`setup` reports booleans); the host is told never to read them |
 | Dependencies | One package (`httpx`), installed into a private venv at `~/.cache/omnimed/venv` on first use |
 | Model text in the browser | Rendered as Markdown only through DOMPurify; plain text if the libraries do not load |
-| Data | Runs stay on the user's machine; nothing is uploaded except the questions sent to the chosen providers and the identifiers sent to the literature APIs |
+| Data | Runs stay on the user's machine. Sent out: the questions (to the chosen providers), identifiers (to the literature APIs), and, in the Claude app only, the conversation page, published as a private artifact to show it beside the chat |
 | Paid models | Never added unless the user chose them; the judge prefers free models |
 | Limits | 5 models per run; 40 citations and 8 full-text look-ups per answer; PubMed paced at 2.5 requests/s (9 with `NCBI_API_KEY`) |
 

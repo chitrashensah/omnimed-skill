@@ -323,6 +323,32 @@ class Report(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_HTTPX, "needs httpx")
+class ConversationView(unittest.TestCase):
+    """A follow-up adds to one page kept in the conversation's first run."""
+
+    def _run(self, root, name, question, after=None):
+        run = root / name
+        (run / "answers").mkdir(parents=True)
+        (run / "question.txt").write_text(question)
+        if after:
+            cli.write_run_meta(run, after=str(after))
+        (run / "comparison.json").write_text(json.dumps(
+            {"question": question, "answers": [], "candidates": []}))
+        return run
+
+    def test_follow_up_updates_the_first_runs_page(self):
+        with tempfile.TemporaryDirectory() as d:
+            first = self._run(Path(d), "a", "Which miRNAs protect against DOX?")
+            second = self._run(Path(d), "b", "Which have in vivo data?", after=first)
+            page = cli.write_conversation(second)
+            self.assertEqual(page, first / "conversation.html")
+            html = page.read_text()
+            self.assertIn("Which miRNAs protect against DOX?", html)
+            self.assertIn("Which have in vivo data?", html)
+            self.assertEqual([p.name for p in cli.run_chain(second)], ["a", "b"])
+
+
+@unittest.skipUnless(HAVE_HTTPX, "needs httpx")
 class Unreachable(unittest.TestCase):
     """A database that cannot be reached must not look like 'no papers exist'."""
 
