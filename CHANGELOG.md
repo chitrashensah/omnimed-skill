@@ -9,6 +9,11 @@
   now part of the claim, and disease, drug, cell-type and cell-line abbreviations (DIC, DOX, MSC,
   EVs, AC16, H9C2…) are no longer treated as genes. Checker version 4: saved results are re-checked.
 
+### Changed
+- After a comparison, Claude shows a short conclusion, the scoreboard and one line of problems per
+  model, then stops; the answers are in the browser view. It no longer re-reviews papers by hand,
+  edits OmniMed's code or commits in the same turn.
+
 ## 0.2.2 — 2026-10-23
 
 ### Fixed

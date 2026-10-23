@@ -100,7 +100,9 @@ it is running, and use a long timeout (10 minutes).
 ### 5. Write the verdict and open the browser view
 
 Read `report.md` from the run directory, then write a short verdict
-(3–6 sentences or bullets) to a file:
+(3–6 sentences or bullets) to a file. It is the conclusion comparing the
+answers; base it on the report and the answers, not on your own review of the
+cited papers (the checker does that; open papers only if the user asks):
 
 - Lead with the single most important finding.
 - Rank candidates by the **strength of independent evidence** (papers, trials,
@@ -125,13 +127,19 @@ for citations and judge score, problems highlighted, and every answer in full.
 
 ### 6. Present in chat
 
+Keep it short; the answers themselves are in the browser, one box per model.
 Show, in this order:
 1. Your verdict.
-2. The **Scoreboard** and **Candidates** tables from `report.md`, exactly as written.
-3. **Problems found**, in full. A fabricated or off-topic citation is the most
-   important thing the user can learn from this run.
-4. One line: the full side-by-side answers are open in the browser (give the
-   `report_html` path), and you can paste any answer here on request.
+2. The **Scoreboard** table from `report.md`, exactly as written.
+3. Problems, one line per model (e.g. "GPT-OSS: 1 off-topic citation"). The
+   details are in the browser view.
+4. One line: the side-by-side answers are open in the browser (give the
+   `report_html` path); you can paste any answer or the candidates table on request.
+
+Then stop. Do not start other work in the same turn: no re-checking papers by
+hand, no changes to OmniMed's code, no commits. If a result looks wrong (say, a
+citation flagged off-topic that seems on-topic), say so in one line and let the
+user decide.
 
 Never summarise or paraphrase a model's answer in place of showing it. If the
 browser did not open (`opened_in_browser: false`) or the user prefers the chat,
