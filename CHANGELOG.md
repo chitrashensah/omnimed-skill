@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 — 2026-10-23
+
+### Fixed
+- The judge saw at most 6,000 characters of an answer, with the middle cut. A complete 6.9k-character
+  answer was scored 4/10 as "partially truncated", penalised for OmniMed's own trimming. The limit is
+  now 12,000 characters, and anything trimmed carries a note telling the judge not to count it.
+
 ## 0.2.1 — 2026-10-23
 
 ### Fixed
