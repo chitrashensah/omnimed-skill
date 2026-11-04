@@ -28,14 +28,16 @@ from . import literature_service
 # - Link format and the note on automatic checking stop the "I cannot browse
 #   the internet, so I cannot provide links" padding: a PubMed link needs no
 #   browsing, and the platform verifies every identifier after the answer.
-BIOMEDICAL_BASE_PROMPT = (
-    "The user is a biomedical researcher. Answer at expert depth with precise terminology.\n\n"
-    "Citations: after a specific finding, or a claim about what a molecule does, cite it as "
-    "[PMID: 12345678](https://pubmed.ncbi.nlm.nih.gov/12345678/). Do not cite definitions, "
-    "reasoning or recommendations. If you do not know a real PMID, cite author and year or "
-    "leave the claim uncited; never invent an identifier. Citations are checked against "
-    "PubMed automatically, so do not add disclaimers about browsing or verification."
+# How to cite, so the citation checker can read and verify it. It is all a
+# model is told in Biomedical mode: every other instruction changed the answer
+# (tone, depth, length, structure) away from what the model gives on its own.
+CITATION_PROMPT = (
+    "When you state a specific finding, cite it as "
+    "[PMID: 12345678](https://pubmed.ncbi.nlm.nih.gov/12345678/) or by DOI. "
+    "Never invent an identifier; if you are unsure of one, leave the claim uncited."
 )
+
+BIOMEDICAL_BASE_PROMPT = CITATION_PROMPT
 
 
 # ── Literature grounding (the per-box "database" and "date range" options) ───
@@ -53,7 +55,7 @@ LITERATURE_PAPERS_MAX = 25            # what one PubMed / Europe PMC page return
 # was tried first, but PubMed already ANDs every term, so nearly every result
 # "matched" — including an immune-adverse-events review for a fibrosis question.
 LITERATURE_AUTO_ABSTRACTS = 8
-LITERATURE_ABSTRACT_CHARS = 700
+LITERATURE_ABSTRACT_CHARS = 10_000   # whole abstracts; they were cut at 700
 
 # Words about the request rather than the topic. PubMed ANDs every term, so
 # each one left in narrows the search to papers that use it: "Which miRNAs are
@@ -62,7 +64,25 @@ LITERATURE_ABSTRACT_CHARS = 700
 # cite properly" searched for "citations", "link" and "cite", and the model was
 # handed papers ABOUT citations and links (a citation-network recommender,
 # "social prescribing link workers") instead of anything on miRNAs.
+# Written-out RNA classes, longest first ("long non-coding RNA" before "non-coding RNA").
+_RNA_CLASSES = (
+    (r"\blong[\s-]*non[\s-]*coding[\s-]*rnas?\b|\blncrnas?\b", "lncRNA"),
+    (r"\bcircular[\s-]*rnas?\b|\bcircrnas?\b", "circRNA"),
+    (r"\bmicro[\s-]*rnas?\b|\bmirnas?\b", "microRNA"),
+    (r"\bnon[\s-]*coding[\s-]*rnas?\b|\bncrnas?\b", "ncRNA"),
+)
+# Disease and tissue words, which keep a search on topic.
+_CONTEXT_STEMS = (
+    "cardi", "heart", "myocard", "infarct", "fibro", "hypertroph", "isch", "reperf",
+    "atheroscl", "vascul", "endotheli", "arrhythm", "doxorubicin", "anthracycl", "ferropt",
+    "pyropt", "apopto", "seps", "hypertens", "aort", "coronar", "stroke", "valv", "disease",
+    "injur", "failure", "remodel", "angiogen", "inflamm", "diabet", "cancer", "tumor", "tumour",
+)
+
 _QUERY_FILLER = {
+    "hi", "hello", "thanks", "thank", "just", "cases", "case", "over", "down", "models",
+    "model", "expression", "overexpression", "downregulation", "upregulation", "regulation",
+    "such", "like", "may", "might", "these", "those", "them", "kind", "types", "type",
     "citation", "citations", "cite", "cited", "citing", "reference", "references",
     "source", "sources", "link", "links", "url", "urls", "pmid", "pmids", "doi",
     "paper", "papers", "article", "articles", "literature", "pubmed", "publication",
@@ -89,12 +109,16 @@ def parse_literature(raw, models: list) -> dict:
         db = opt.get("db")
         if db not in LITERATURE_DATABASES:
             continue
-        years = LITERATURE_RANGES.get(opt.get("dates") or "all")
+        dates = str(opt.get("dates") or "all")
+        years = LITERATURE_RANGES.get(dates)
+        # A year ("2018") as well as a range: researchers say "since 2018".
+        since = (int(dates) if dates.isdigit() and 1900 <= int(dates) <= date.today().year
+                 else date.today().year - years if years else None)
         try:
             papers = max(1, min(int(opt.get("papers")), LITERATURE_PAPERS_MAX))
         except (TypeError, ValueError):
             papers = "auto"                 # no preference: the model decides
-        out[m] = (db, date.today().year - years if years else None, papers)
+        out[m] = (db, since, papers)
     return out
 
 
@@ -110,15 +134,42 @@ def literature_terms(question: str, previous: str = "") -> list:
         text = text or ""
         if "?" in text:
             text = text[:text.index("?")]
-        words = re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", text)
-        return list(dict.fromkeys(
-            w for w in words
-            if w.lower() not in _QUERY_FILLER and w.lower() not in literature_service._STOPWORDS))
+        # RNA classes written out ("micro RNA", "long non coding RNAs") were
+        # split into words that every paper had to contain; asking for two
+        # classes made a paper need both. They become one OR group instead.
+        classes = []
+        for pattern, name in _RNA_CLASSES:
+            if re.search(pattern, text, re.I):
+                classes.append(name)
+                text = re.sub(pattern, " ", text, flags=re.I)
+        words = [w for w in dict.fromkeys(re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", text))
+                 if w.lower() not in _QUERY_FILLER and w.lower() not in literature_service._STOPWORDS]
+        # Most central first, since a search that finds nothing drops terms from
+        # the end: named RNAs, the RNA classes, the disease context, the rest.
+        # In question order the topic ("cardiovascular disease") came last and
+        # was dropped before a typo ("proeprly"), leaving an oral-cancer paper.
+        named = [w for w in words if literature_service._rna_entities(w)]
+        context = [w for w in words if w not in named and w.lower().startswith(_CONTEXT_STEMS)]
+        rest = [w for w in words if w not in named and w not in context]
+        group = ([classes[0]] if len(classes) == 1 else
+                 [f"({' OR '.join(classes)})"] if classes else [])
+        return named + group + context + rest
 
     found = terms(question)
     if len(found) < 2 and previous:
         found = list(dict.fromkeys(found + terms(previous)))
     return found
+
+
+def topic_terms(question: str) -> list:
+    """The question's topic without its RNA names or classes: disease, tissue, drug.
+
+    What the preprint scan pairs each candidate with ("miR-210 AND doxorubicin").
+    """
+    classes = {name.lower() for _, name in _RNA_CLASSES}
+    return [t for t in literature_terms(question)
+            if not t.startswith("(") and t.lower() not in classes
+            and not literature_service._rna_entities(t)]
 
 
 def literature_block(db: str, year_from: int | None, papers: list,
@@ -131,12 +182,9 @@ def literature_block(db: str, year_from: int | None, papers: list,
     # so for anything it cited from memory it reached for the classic papers
     # it knows best (2007, 2008, 2013) despite "Past 5 years". The range is
     # strict, at the user's request: older work may be described, not cited.
-    dates = (f" Date range: cite only papers published in {year_from} or later. Do not cite "
-             "older papers, even landmark ones; if older work matters, describe it without a "
-             "citation.") if year_from else ""
+    dates = f" Cite only papers published in {year_from} or later." if year_from else ""
     if not papers:
-        return (f"[OmniMed searched {name}{since} for this question and found no papers. Mention "
-                f"that briefly, then answer from established knowledge without inventing citations.{dates}]")
+        return f"[A {name} search for this question found no papers{since}.{dates}]"
     rows = []
     for i, p in enumerate(papers, 1):
         ident = f"PMID: {p['pmid']}" if p.get("pmid") else (f"DOI: {p['doi']}" if p.get("doi") else "")
@@ -150,12 +198,12 @@ def literature_block(db: str, year_from: int | None, papers: list,
     # the citations again" got these papers listed back instead of an answer.
     # "Answer fully" because a model told only to ground itself in off-topic
     # results declined to answer at all.
-    return (f"[Background: {len(papers)} papers from {name}{since}, found by OmniMed's keyword "
-            "search. The user did not write or see this list.]\n"
-            "Use the relevant ones as evidence and cite them inline; ignore off-topic ones. "
-            "Answer fully, not only from these papers, and do not list them back. \"The "
-            f"citations\" in the user's message means those in earlier answers, not this list.{dates}\n\n"
-            + "\n\n".join(rows) + "\n[End of background]")
+    # Kept to one line on purpose: each extra instruction here reshaped the
+    # answer. "The user did not write or see this list" alone stops models
+    # from listing it back or treating it as the user's own references.
+    return (f"[{name} papers found for this question; the user did not write or see this "
+            f"list. Cite any that are relevant.{dates}]\n\n"
+            + "\n\n".join(rows) + "\n[End of papers]")
 
 
 MAX_MISSED_QUESTIONS = 3
@@ -176,9 +224,7 @@ def missed_note(questions) -> str:
     if not qs:
         return ""
     lines = "\n".join(f"- {q}" for q in qs)
-    return ("[CONTEXT: you joined this conversation part-way. Earlier, the user asked "
-            "these questions, which other models answered and you did not see:\n"
-            f"{lines}\nIf the message below refers back to them, answer it on that topic.]")
+    return f"[Earlier in this chat the user asked:\n{lines}]"
 
 
 async def grounded_message(model: str, full_message: str, literature: dict, search_for,
@@ -260,14 +306,13 @@ def literature_searcher(question: str, literature: dict, previous: str = ""):
 
 
 # ── Conversation history ────────────────────────────────────────────────────
-MAX_HISTORY_ITEMS = 12        # ≈6 exchanges, whatever the client sends
-# An item cap alone does not bound cost here. Answers in this app are long
-# biomedical writeups with citation lists — several thousand characters each —
-# so 12 of them is tens of thousands of tokens, resent to every model on every
-# turn and multiplied by the number of boxes. These budgets are what actually
-# bounds the bill; the item cap only limits how far back the thread reaches.
-MAX_HISTORY_CHARS = 24_000        # ≈6k tokens of history per model per turn
-MAX_HISTORY_MSG_CHARS = 4_000     # one long answer cannot crowd out the rest
+# Each model gets its whole earlier conversation, answers unshortened: trimming
+# them changed what it built on. The only bound is a safety margin under the
+# smallest context window offered (~128k tokens), so a very long chat cannot
+# make a request fail; the oldest turns go first if it is ever reached.
+MAX_HISTORY_ITEMS = 1_000
+MAX_HISTORY_CHARS = 300_000       # ≈75k tokens
+MAX_HISTORY_MSG_CHARS = 300_000   # no per-answer trimming
 
 
 def _trim_msg(content: str, role: str) -> str:

@@ -80,14 +80,13 @@ class Models(unittest.TestCase):
         for key in models.MODELS:
             self.assertIn(f'"{key}"', src, f"model key {key!r} is not a backend key")
 
-    def test_judge_never_same_provider(self):
+    def test_judge_never_same_maker(self):
         with unittest.mock.patch.object(models, "available", return_value=True):
-            for key, spec in models.MODELS.items():
+            for key in models.MODELS:
                 chain = models.judge_chain(key, requested="gemini")
                 self.assertTrue(chain, key)
                 for j in chain:
-                    self.assertNotEqual(models.MODELS[j]["provider"], spec["provider"],
-                                        f"{j} would judge {key}")
+                    self.assertNotEqual(models.maker(j), models.maker(key), f"{j} would judge {key}")
 
     def test_missing_key_is_reported_not_raised(self):
         saved = os.environ.pop("COHERE_API_KEY", None)
@@ -218,13 +217,13 @@ class SharedWithWebsite(unittest.TestCase):
             self.assertEqual(mine, (backend / name).read_text(),
                              f"{name} differs from the website's; run sync_from_backend.sh")
 
-    def test_research_prompt_is_generated_from_the_website(self):
-        builtin = SITE / "omnimed-frontend" / "src" / "data" / "builtinPrompts.js"
-        if not builtin.exists():
-            self.skipTest("website repo not found (set OMNIMED_SITE_DIR)")
-        mirna = re.search(r"id: 'builtin_mirna'.*?content: `(.*?)`", builtin.read_text(), re.S).group(1)
-        expected = grounding.BIOMEDICAL_BASE_PROMPT.strip() + "\n\n" + mirna.strip() + "\n"
-        self.assertEqual((ROOT / "skills/omnimed/reference/research-prompt.md").read_text(), expected)
+    def test_models_get_only_the_citation_instruction(self):
+        # No answer format or persona: each model answers in its own way.
+        self.assertEqual(cli.system_prompt(), grounding.CITATION_PROMPT)
+        self.assertIn("PMID", grounding.CITATION_PROMPT)
+        self.assertLess(len(grounding.CITATION_PROMPT.split()), 40)     # one short rule, no persona
+        self.assertEqual(grounding.BIOMEDICAL_BASE_PROMPT, grounding.CITATION_PROMPT)
+        self.assertNotIn("Candidates", cli.system_prompt())
 
 
 @unittest.skipUnless(HAVE_HTTPX, "httpx not installed")
@@ -323,6 +322,135 @@ class Report(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_HTTPX, "needs httpx")
+class HostJudge(unittest.TestCase):
+    def _comp(self, models_):
+        return {"question": "q", "judge_mode": "host", "candidates": [],
+                "answers": [{"model": m, "label": m.upper(), "status": "ok", "text": f"answer by {m}"}
+                            for m in models_]}
+
+    def test_packet_is_blind_and_scores_map_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            (run / "question.txt").write_text("q")
+            comp = self._comp(["gemini38", "deepseek_pro"])
+            page = cli.write_judge_packet(run, comp)
+            text = page.read_text()
+            self.assertIn("## Answer A", text)
+            self.assertNotIn("GEMINI38", text)
+            self.assertNotIn("DEEPSEEK_PRO", text)
+            (run / "comparison.json").write_text(json.dumps(comp))
+            scores = {l: {"evidence": 5, "mechanism": 5, "actionability": 5, "calibration": 5}
+                      for l in comp["host_judge"]["map"]}
+            (run / "s.json").write_text(json.dumps(scores))
+            args = unittest.mock.Mock(run=str(run), file=str(run / "s.json"), by="Claude (host)")
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                cli.cmd_add_scores(args)
+            saved = json.loads((run / "comparison.json").read_text())
+            self.assertTrue(all(a["judge"]["judge"] == "host" for a in saved["answers"]))
+            self.assertNotIn("host_judge", saved)
+
+    def test_claude_scores_all_gpt_only_claude_answers(self):
+        answers = [{"model": "pasted_x", "provider": "anthropic", "status": "ok", "text": "t"},
+                   {"model": "gpt55", "status": "ok", "text": "u"},
+                   {"model": "gemini38", "status": "ok", "text": "v"}]
+        called = []
+
+        async def fake_call(key, *a, **k):
+            called.append(key)
+            return {"status": "ok", "label": "GPT-5.5", "text":
+                    '{"evidence":6,"mechanism":6,"actionability":6,"calibration":6}'}
+        with unittest.mock.patch.object(cli.lit, "verify_citations", side_effect=lambda *a: _coro({})), \
+             unittest.mock.patch.object(cli.lit, "check_unsourced_claims", side_effect=lambda *a: _coro({})), \
+             unittest.mock.patch.object(cli.lit, "profile_candidates", side_effect=lambda *a: _coro([])), \
+             unittest.mock.patch.object(cli.models, "available", return_value=True), \
+             unittest.mock.patch.object(cli.models, "call", side_effect=fake_call):
+            comp = asyncio.run(cli._compare("q", answers, "host"))
+        self.assertEqual(called, ["gpt55"])                  # one call: the Claude answer
+        by = {a["model"]: a for a in comp["answers"]}
+        self.assertIn("gpt", by["pasted_x"]["judges"])
+        self.assertNotIn("judges", by["gpt55"])
+        self.assertNotIn("judges", by["gemini38"])           # no cross-check cost
+        self.assertTrue(all(cli._needs_host(a) for a in comp["answers"]))   # Claude scores all
+
+
+async def _value(v):
+    return v
+
+
+def _coro(v):
+    return _value(v)
+
+
+@unittest.skipUnless(HAVE_HTTPX, "needs httpx")
+class CandidateTitle(unittest.TestCase):
+    """A bullet under '1. **miR-21 — miRNA**' is about miR-21, even when it names miR-29."""
+
+    ANSWER = ("1. **miR-21 — miRNA**  \n- **Regulatory axis**: miR-21 → SPRY1\n"
+              "- **Synergy**: Complements miR-29 overexpression [PMID: 19043405]\n\n"
+              "2. **miR-29 family — miRNA**  \n- **Synergy**: Pairs with miR-21 [PMID: 18723672]\n")
+
+    def test_title_joins_the_claim(self):
+        ctx = lit._claim_context(self.ANSWER, "19043405")
+        self.assertIn("miR-21 — miRNA", ctx)
+        self.assertIn("mir-21", lit._rna_entities(ctx))
+        ctx2 = lit._claim_context(self.ANSWER, "18723672")
+        self.assertIn("miR-29 family", ctx2)
+        self.assertNotIn("miR-21 — miRNA", ctx2)
+
+    def test_field_bullet_is_not_a_title(self):
+        text = "- **Regulatory axis**: miR-21 → PTEN\n- **Evidence**: strong [PMID: 1]\n"
+        self.assertEqual(lit._section_heading(text, text.index("- **Evidence")), "")
+
+
+@unittest.skipUnless(HAVE_HTTPX, "needs httpx")
+class CutOff(unittest.TestCase):
+    def test_truncated_answer_is_flagged(self):
+        comp = {"question": "q", "answers": [{"model": "gemini", "label": "Gemini", "status": "ok",
+                                               "text": "partial [PMID: 2883", "truncated": True}],
+                "candidates": []}
+        self.assertIn("Cut off", cli.report.render(comp))
+        self.assertIn('"truncated": true', cli.report_html.render(comp))
+
+
+@unittest.skipUnless(HAVE_HTTPX, "needs httpx")
+class OneJudge(unittest.TestCase):
+    def test_shared_judge_is_outside_every_compared_provider(self):
+        answers = [{"model": "gemini38"}, {"model": "deepseek_pro"}, {"model": "groq"}]
+        with unittest.mock.patch.object(cli.models, "available", return_value=True):
+            judges = cli.shared_judges(answers, None)
+        used = {cli.models.maker(a["model"]) for a in answers}
+        self.assertTrue(judges)
+        self.assertTrue(all(cli.models.maker(j) not in used for j in judges))
+
+    def test_judge_is_never_the_same_maker(self):
+        # GPT-OSS is OpenAI's even on Groq; Qwen is Qwen's on Groq and OpenRouter.
+        self.assertEqual(cli.models.maker("groq"), "openai")
+        self.assertEqual(cli.models.maker("groq_qwen38"), cli.models.maker("qwen38flash"))
+        answers = [{"model": k} for k in ("opus55", "gemini38", "gpt55", "deepseek_pro", "cohere")]
+        with unittest.mock.patch.object(cli.models, "available", return_value=True):
+            judges = cli.shared_judges(answers, None)
+        self.assertNotIn("groq", judges)          # an OpenAI model may not judge GPT-5.5
+        self.assertTrue(all(cli.models.maker(j) == "qwen" for j in judges))
+
+    def test_pasted_answer_provider_counts(self):
+        answers = [{"model": "pasted_1", "provider": "openai"}, {"model": "gemini38"}]
+        with unittest.mock.patch.object(cli.models, "available", return_value=True):
+            judges = cli.shared_judges(answers, None)
+        self.assertFalse(any(cli.models.maker(j) in ("openai", "google") for j in judges))
+
+
+class DateRanges(unittest.TestCase):
+    @unittest.skipUnless(HAVE_HTTPX, "needs httpx")
+    def test_year_is_accepted(self):
+        lit = grounding.parse_literature({"m": {"db": "pubmed", "dates": "2018"}}, ["m"])
+        self.assertEqual(lit["m"][1], 2018)
+        self.assertEqual(cli._dates("2018"), "2018")
+        self.assertEqual(cli._dates("5y"), "5y")
+        with self.assertRaises(Exception):
+            cli._dates("3000")
+
+
+@unittest.skipUnless(HAVE_HTTPX, "needs httpx")
 class ConversationView(unittest.TestCase):
     """A follow-up adds to one page kept in the conversation's first run."""
 
@@ -383,6 +511,146 @@ class Unreachable(unittest.TestCase):
             msg, given = asyncio.run(go())
         self.assertEqual(given.get("error"), "SEARCH_FAILED")
         self.assertNotIn("found no papers", msg)
+
+
+@unittest.skipUnless(HAVE_HTTPX, "needs httpx")
+class ReferenceLists(unittest.TestCase):
+    """A model given papers cites them as [4] and lists them at the end."""
+
+    REFS = (
+        "miR-101 reduced interstitial fibrosis after MI.[1]\n"
+        "miR-21 drives fibroblast survival.[2]\n\n"
+        "### Primary studies\n\n"
+        "1. Pan Z, et al. MicroRNA-101 inhibited postinfarct cardiac fibrosis and improved "
+        "left ventricular compliance via the FBJ osteosarcoma oncogene pathway. "
+        "*Circulation.* 2012;126:840-850.\n"
+        "2. Thum T, et al. MicroRNA-21 contributes to myocardial disease by stimulating "
+        "MAP kinase signalling in fibroblasts. *Nature.* 2008;456:980-984.\n"
+        "3. A numbered point with no year, which is not a reference.\n"
+    )
+
+    def test_entries_are_extracted_with_titles(self):
+        refs = lit.extract_reference_list(self.REFS)
+        self.assertEqual([r["num"] for r in refs], ["1", "2"])   # 3 has no year
+        self.assertIn("MicroRNA-101 inhibited postinfarct", refs[0]["title"])
+        self.assertEqual(refs[1]["author"], "Thum")
+
+    def test_particle_surnames_survive(self):
+        refs = lit.extract_reference_list(
+            "4. van Rooij E, et al. Dysregulation of microRNAs after myocardial infarction "
+            "reveals a role of miR-29 in cardiac fibrosis. *PNAS.* 2008;105:13027.\n")
+        self.assertEqual(refs[0]["author"], "van Rooij")
+
+    def test_claim_context_comes_from_the_body_not_the_entry(self):
+        """"[1]" appears twice: the claim is where it is used, not defined."""
+        body = lit._reference_body(self.REFS)
+        self.assertIn("miR-101 reduced interstitial fibrosis", body)
+        self.assertNotIn("Pan Z", body)           # the entry itself is excluded
+        self.assertIn("[1]", lit._claim_context(body, "[1]"))
+
+    def test_a_different_paper_by_the_same_author_is_not_accepted(self):
+        """Author+year alone once matched a miR-132 paper to an unrelated one."""
+        self.assertLess(
+            lit._title_similarity(
+                "Preclinical development of a miR-132 inhibitor for heart failure treatment",
+                "Long Noncoding RNA-Enriched Vesicles Secreted by Hypoxic Cardiomyocytes"),
+            lit.TITLE_MATCH_MIN)
+
+
+class Preprints(unittest.TestCase):
+    """Latest preprints go to the conclusion, labelled, never to the models."""
+
+    def _paper(self, title, doi, abstract=""):
+        return lit.Paper(source="preprint", title=title, abstract=abstract, journal="bioRxiv",
+                         year="2026", doi=doi, url=f"https://doi.org/{doi}",
+                         extra={"posted": "2026-03-01", "ppr_id": "", "published_as": None})
+
+    def _fake(self, calls):
+        async def fake(client, query, limit=3, months=24):
+            calls.append(query)
+            if query.startswith("TITLE_ABS:(microRNA"):     # the discovery search
+                return [self._paper("miR-499 and miR-210-3p in doxorubicin cardiotoxicity", "10.1101/new1",
+                                    "miR-499 protected cardiomyocytes; miR-210-3p too."),
+                        self._paper("miR-499 in doxorubicin cardiotoxicity", "10.1101/new2"),
+                        self._paper("miR-7 in doxorubicin-treated tumours", "10.1101/off")]
+            if "210" in query:
+                return [self._paper("miR-210 rescues doxorubicin cardiotoxicity", "10.1101/a1"),
+                        # mentions doxorubicin, but not the heart: dropped
+                        self._paper("miR-210 and doxorubicin in breast cancer", "10.1101/a2")]
+            return []
+        return fake
+
+    def test_scan_groups_by_candidate_and_finds_new_ones(self):
+        calls = []
+        with unittest.mock.patch.object(lit, "search_preprints", self._fake(calls)), \
+                unittest.mock.patch.object(lit, "_cache_get", return_value=None):
+            res = asyncio.run(lit.scan_preprints(["mir-210-3p", "mir-21"], ["doxorubicin", "cardiotoxicity"]))
+        self.assertEqual(res["by_candidate"], {"miR-210-3p": ["P1"]})
+        # miR-210-3p is a candidate already (same family), so only miR-499 is new
+        self.assertEqual([n["name"] for n in res["new"]], ["miR-499"])
+        self.assertEqual(len(res["new"][0]["ids"]), 2)
+        self.assertEqual(len(res["preprints"]), 3)       # the two off-topic ones are dropped
+        self.assertFalse(res["unavailable"])
+
+    def test_candidate_past_the_search_limit_is_not_called_new(self):
+        """Only the first few candidates get their own search, but every one a
+        model named still counts as known, or a low-ranked candidate came back
+        as "named by no model"."""
+        calls = []
+        many = [f"mir-{i}" for i in range(100, 100 + lit.PREPRINT_CANDIDATES)] + ["mir-499"]
+        with unittest.mock.patch.object(lit, "search_preprints", self._fake(calls)), \
+                unittest.mock.patch.object(lit, "_cache_get", return_value=None):
+            res = asyncio.run(lit.scan_preprints(many, ["doxorubicin", "cardiotoxicity"]))
+        # miR-499 is last, past the per-candidate search limit, but a model
+        # named it, so the discovery preprint must not report it as new.
+        self.assertNotIn("miR-499", [n["name"] for n in res["new"]])
+
+    def test_outage_is_unavailable_not_empty(self):
+        async def down(*a, **k):
+            raise lit.httpx.ConnectError("blocked")
+        with unittest.mock.patch.object(lit, "search_preprints", down), \
+                unittest.mock.patch.object(lit, "_cache_get", return_value=None), \
+                unittest.mock.patch.object(lit, "_cache_put") as put:
+            res = asyncio.run(lit.scan_preprints(["mir-21"], ["fibrosis"]))
+        self.assertTrue(res["unavailable"])
+        put.assert_not_called()
+
+    def test_models_are_not_given_preprints(self):
+        seen = {}
+
+        class Resp:
+            def raise_for_status(self): pass
+            def json(self): return {"resultList": {"result": []}}
+
+        class Client:
+            async def get(self, url, params=None):
+                seen.update(params or {})
+                return Resp()
+        asyncio.run(lit.search_europepmc(Client(), "miR-21 fibrosis"))
+        self.assertIn("NOT SRC:PPR", seen["query"])
+
+    def test_council_cites_preprints_by_id_only(self):
+        scan = {"since": "2024-11-01", "preprints": {"P1": {"title": "T", "journal": "bioRxiv",
+                "abstract": "A", "extra": {"posted": "2026-03-01"}}}, "by_candidate": {"miR-210": ["P1"]}, "new": []}
+        prompt = rubric.build_council_prompt("q", {"m": "miR-210 helps"}, preprints=scan)
+        self.assertIn("[P1]", prompt)
+        self.assertIn("NOT peer-reviewed", prompt)
+        reply = json.dumps({"headline": "h", "candidates": [{"name": "miR-210", "test": "mimic in hiPSC-CMs"}],
+                            "preprints": [{"id": "p1", "stance": "supports", "note": "n"},
+                                          {"id": "10.1101/x", "stance": "supports"}]})
+        v = rubric.parse_council_reply(reply)
+        self.assertEqual(v["candidates"][0]["test"], "mimic in hiPSC-CMs")
+        self.assertEqual([n["id"] for n in v["preprints"]], ["P1"])
+
+    def test_report_labels_preprints(self):
+        comp = {"question": "q", "answers": [], "candidates": [],
+                "preprints": {"since": "2024-11-01", "by_candidate": {"miR-210": ["P1"]}, "new": [],
+                              "preprints": {"P1": self._paper("T", "10.1101/a1").to_dict()}}}
+        md = report.render(comp)
+        self.assertIn("Latest preprints (not peer-reviewed", md)
+        self.assertIn("`P1`", md)
+        comp["preprints"] = {"unavailable": True, "preprints": {}}
+        self.assertIn("unknown", report.render(comp))
 
 
 @unittest.skipUnless(HAVE_HTTPX and os.getenv("OMNIMED_LIVE"), "set OMNIMED_LIVE=1 for PubMed checks")

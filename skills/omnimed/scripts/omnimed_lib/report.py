@@ -73,6 +73,34 @@ def candidates(comp: dict) -> str:
     return "\n".join(rows)
 
 
+def preprints(comp: dict) -> str | None:
+    """The latest preprints on the candidates, by id, for the verdict to cite."""
+    scan = comp.get("preprints")
+    if scan is None:
+        return None
+    if scan.get("unavailable"):
+        return ("_The preprint search (Europe PMC) did not respond, so this is unknown, "
+                "not empty. Run `compare` again later._")
+    papers = scan.get("preprints") or {}
+    groups = [(name, ids, False) for name, ids in (scan.get("by_candidate") or {}).items()]
+    groups += [(n["name"], n.get("ids") or [], True) for n in scan.get("new") or []]
+    if not papers or not groups:
+        return f"_No preprints since {scan.get('since', '')} on these candidates._"
+    out = []
+    for name, ids, new in groups:
+        out.append(f"**{name}**" + (" (named by no model; only in recent preprints)" if new else ""))
+        for pid in ids:
+            p = papers.get(pid) or {}
+            extra = p.get("extra") or {}
+            line = (f"- `{pid}` [{p.get('title') or p.get('doi')}]({p.get('url')}) · "
+                    f"{p.get('journal', 'preprint')}, posted {extra.get('posted') or p.get('year', '')}")
+            pub = extra.get("published_as")
+            if pub:
+                line += f" · since published: [{pub.get('ref') or pub.get('url')}]({pub.get('url')})"
+            out.append(line)
+    return "\n".join(out)
+
+
 def papers_given(g: dict | None) -> str:
     """'📚 25 papers (auto) · PubMed since 2021', as the website labels it."""
     if not g:
@@ -133,16 +161,26 @@ def render(comp: dict) -> str:
          "from the same provider as the answer it scores, and the judge is not told "
          "which model wrote it. Treat it as a hypothesis, not ground truth; "
          "wet-lab results are the ground truth."),
+        *([comp["judge_note"]] if comp.get("judge_note") else []),
         "## Candidates, checked against the literature",
         candidates(comp),
         ("Counts come from PubMed and ClinicalTrials.gov, not from the answers. "
          "How many models named a candidate is weak evidence on its own, because models "
          "share training data and can be wrong together."),
     ]
+    pre = preprints(comp)
+    if pre is not None:
+        parts += [f"## Latest preprints (not peer-reviewed, since {comp['preprints'].get('since', '')})",
+                  pre,
+                  ("Found by OmniMed's own search of bioRxiv, medRxiv and other servers via "
+                   "Europe PMC, not by the models, which answered from peer-reviewed papers. "
+                   "Preprints have not been peer-reviewed.")]
 
     flag_blocks = []
     for a in comp["answers"]:
         flags = _flagged(a.get("verification"), (a.get("grounding") or {}).get("since"))
+        if a.get("truncated"):
+            flags.insert(0, "- **Cut off**: the answer hit the length limit; its end is missing")
         j = a.get("judge") or {}
         if j.get("score") and j["score"].get("red_flags"):
             flags += [f"- Judge red flag: {f}" for f in j["score"]["red_flags"]]
@@ -164,6 +202,8 @@ def render(comp: dict) -> str:
         j = a.get("judge") or {}
         if j.get("score"):
             meta.append(f"judged by {j.get('judge_label', j.get('judge'))}")
+        if a.get("truncated"):
+            meta.append("**cut off**")
         body = (_demote(a.get("text")) if a.get("status") == "ok" else
                 f"_No answer: {a.get('error')}_" + (f" ({a['detail']})" if a.get("detail") else ""))
         parts.append(head + ("\n_" + " · ".join(meta) + "_" if meta else "") + "\n\n" + (body or ""))

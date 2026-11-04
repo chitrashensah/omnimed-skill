@@ -38,7 +38,6 @@ material goes to files in the run directory.
 | Path | Responsibility |
 |---|---|
 | `skills/omnimed/SKILL.md` | What Claude reads: when to use the skill, the workflows, the rules |
-| `skills/omnimed/reference/research-prompt.md` | The prompt every model gets (website base prompt + "miRNA Research"); generated, never edited by hand |
 | `skills/omnimed/reference/interpreting-results.md` | What each metric means |
 | `scripts/omnimed.py` | The CLI: setup, models, defaults, search, verify, unsourced, ask, run, compare, add-answer, remove-answer, add-verdict, open |
 | `omnimed_lib/models.py` | The 23-model registry (mirrors the website), provider calls over plain HTTP, judge selection |
@@ -53,13 +52,11 @@ material goes to files in the run directory.
 ```mermaid
 flowchart LR
     W[omnimed-backend/services<br/>grounding · literature_service · agent_service] -- "sync_from_backend.sh<br/>(byte-identical copy)" --> S[omnimed_lib]
-    F[omnimed-frontend builtinPrompts.js<br/>+ grounding.BIOMEDICAL_BASE_PROMPT] -- generated --> P[reference/research-prompt.md]
     T[tests: SharedWithWebsite] -. fails if they differ .-> S
-    T -. fails if they differ .-> P
 ```
 
 The three shared modules live in the website's backend and are copied, unchanged,
-by `scripts/sync_from_backend.sh`, which also regenerates the research prompt.
+by `scripts/sync_from_backend.sh`.
 `tests/test_omnimed.py` fails if any copy differs from the website's, so a fix
 made in one place cannot silently diverge. The modules import only the standard
 library, `httpx` and each other (`grounding` imports `literature_service`), which
@@ -75,7 +72,6 @@ sequenceDiagram
     participant O as omnimed.py
     participant L as Literature APIs
     participant M as Models (≤5)
-    participant J as Judge (other provider)
 
     C->>O: run "question" --models … [--db --dates --papers] [--after run]
     O->>O: history per model from the --after chain,<br/>earlier questions each model missed
@@ -83,14 +79,16 @@ sequenceDiagram
         O->>L: one keyword search per database + date range
     end
     par each model
-        O->>M: research prompt + own history + [papers] + question
+        O->>M: citation instruction + own history + [papers] + question
         M-->>O: answer
     end
     O->>L: verify citations, uncited claims, candidate profiles
-    O->>J: one blinded rubric call per answer (judge ≠ its provider)
+    O-->>C: judge_packet.md (answers as A, B, C…, shuffled)
+    O->>M: GPT-5.5 scores Claude answers, if any
+    C->>O: add-scores (Claude's blinded scores for every answer)
     O-->>C: JSON: scoreboard, candidates, report paths
     C->>C: read report.md, write verdict
-    C->>O: add-verdict → conversation.html (artifact beside the chat, or browser)
+    C->>O: add-verdict → conversation.html opens in the browser
 ```
 
 What each model receives, and when, is decided by the shared `grounding.py`,
@@ -98,16 +96,17 @@ exactly as on the website:
 
 | Part | When |
 |---|---|
-| Research prompt (base rules + research format) | Always, unless `--no-prompt` |
-| Its own earlier questions and answers | Follow-ups (`--after`): ≤ 12 messages, ≤ 24,000 characters |
+| How to cite (nothing about format or content) | Always, unless `--no-prompt` |
+| Its own earlier questions and answers | Follow-ups (`--after`): the whole conversation, unshortened (up to ~75k tokens) |
 | Earlier questions it never saw | It was not part of an earlier run |
 | Papers from PubMed / Europe PMC | `--db` given; `auto` = the 25 best matches, 8 with abstracts |
-| Date-range rule (strict) | `--dates` given |
+| Date-range rule (strict) | `--dates` given: `1y`, `5y`, `10y` or a start year (`2018`) |
 
 **Independence.** A model never sees another model's answers, so the comparison
 stays fair. **Thinking is always on:** Claude runs adaptive thinking at effort
-`high`; the other providers reason by default; Qwen (OpenRouter) and Cohere
-have a 6,000-token thinking cap because uncapped they returned nothing.
+`high`; the other providers reason by default, with no cap on thinking: output
+ceilings are high (32,768; Gemini 65,536; a lower model maximum is read from the
+provider's error) and the timeout is 10 minutes.
 
 ---
 
@@ -120,11 +119,14 @@ The same three layers as the website, kept in separate fields:
    judged by whether the paper names the claim's molecule or target, with a
    full-text second look (Europe PMC, then NCBI PubMed Central). Results carry a
    `checker_version`; a saved result from an older checker is re-run, not reused.
-2. **AI score.** A judge for each answer, never from that answer's provider
-   (so a host answer from Claude is never judged by a Claude model), never told
-   which model wrote it; overall = the average of evidence, mechanism,
-   actionability and calibration. The website instead uses one judge for all
-   answers to a question, outside every scored provider.
+2. **AI score.** Claude (the host, on the user's subscription) scores every
+   answer from an anonymised, shuffled packet, before it sees which model wrote
+   which. A Claude answer is also scored by GPT-5.5, since Claude may favour its
+   own style even unnamed; its score is the average, and the report gives both.
+   No judge is told which model wrote an answer; overall = the average of
+   evidence, mechanism, actionability and calibration. (`--judge auto`, used
+   only outside the skill's workflow, has one API judge score every answer, as
+   on the website, from a maker none of the compared models come from.)
 3. **Wet-lab verdict.** Recorded on the website; the only ground truth.
 
 ---
@@ -156,7 +158,7 @@ version), so only the new model is asked, checked and scored.
 | API keys | Read from `~/.config/omnimed/*.env` or `OMNIMED_ENV_FILE`, never from the skill folder; never printed (`setup` reports booleans); the host is told never to read them |
 | Dependencies | One package (`httpx`), installed into a private venv at `~/.cache/omnimed/venv` on first use |
 | Model text in the browser | Rendered as Markdown only through DOMPurify; plain text if the libraries do not load |
-| Data | Runs stay on the user's machine. Sent out: the questions (to the chosen providers), identifiers (to the literature APIs), and, in the Claude app only, the conversation page, published as a private artifact to show it beside the chat |
+| Data | Runs stay on the user's machine; nothing is uploaded except the questions sent to the chosen providers and the identifiers sent to the literature APIs |
 | Paid models | Never added unless the user chose them; the judge prefers free models |
 | Limits | 5 models per run; 40 citations and 8 full-text look-ups per answer; PubMed paced at 2.5 requests/s (9 with `NCBI_API_KEY`) |
 

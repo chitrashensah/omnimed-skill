@@ -22,19 +22,20 @@ import httpx
 
 from . import env
 
-TIMEOUT = 300.0              # a research answer can legitimately take minutes
+TIMEOUT = 600.0              # unthrottled reasoning models can think for several minutes
 ANTHROPIC_MAX_TOKENS = 16000  # thinking shares this budget with the answer
 # Same as the website: thinking on (adaptive) and effort "high" on every
 # Claude model; Opus 5.5 and Haiku 5.5 would otherwise default to "medium".
 ANTHROPIC_EFFORT = "high"
-GEMINI_MAX_TOKENS = 8192
-OPENAI_LIKE_MAX_TOKENS = 16384
+# Thinking shares these budgets, so they are set high enough that no model is
+# held back: Gemini 2.5+'s maximum, and room for uncapped reasoning plus a
+# full answer elsewhere. A ceiling is not a charge; only what is written is billed.
+GEMINI_MAX_TOKENS = 65536
+OPENAI_LIKE_MAX_TOKENS = 32768
 RETRY_WAIT = 15              # one retry on a provider's "busy" response
-# Reasoning models (Qwen 3.8, Command A+) think before answering, and the
-# thinking shares the output budget. Uncapped, both spent all 16,384 tokens
-# thinking on a DOX-cardiotoxicity question and returned nothing (2026-10-21).
-# Capped at 6,000, both answered: Qwen in 87s, Cohere in 43s.
-REASONING_BUDGET = 6000
+# No thinking cap on any model (as on the website): a cap shortened Qwen's and
+# Command A+'s reasoning and changed what they answered. If a model still spends
+# its whole budget thinking, it fails with TRUNCATED_BEFORE_ANSWER.
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
@@ -305,11 +306,14 @@ async def _anthropic(client, spec, key, system, message, max_tokens, history=Non
     out = {"text": text, "served_model": data.get("model"),
            "usage": _usage(u.get("input_tokens"), u.get("output_tokens"))}
     if data.get("stop_reason") == "refusal":
-        return {**out, "status": "error", "error": "REFUSED"}
+        # A classifier declined before the model ran. The category names the
+        # policy area ("bio" for research biology), and ncRNA questions draw it.
+        cat = (data.get("stop_details") or {}).get("category")
+        return {**out, "status": "error", "error": "REFUSED", "refusal_category": cat}
     if not text.strip():
         err = "TRUNCATED_BEFORE_ANSWER" if data.get("stop_reason") == "max_tokens" else "EMPTY_RESPONSE"
         return {**out, "status": "error", "error": err}
-    return {**out, "status": "ok"}
+    return _ok(out, data.get("stop_reason") == "max_tokens")
 
 
 async def _gemini(client, spec, key, system, message, max_tokens, history=None):
@@ -335,7 +339,7 @@ async def _gemini(client, spec, key, system, message, max_tokens, history=None):
         err = "TRUNCATED_BEFORE_ANSWER" if reason == "MAX_TOKENS" else (
             "REFUSED" if reason in ("SAFETY", "PROHIBITED_CONTENT") else "EMPTY_RESPONSE")
         return {**out, "status": "error", "error": err}
-    return {**out, "status": "ok"}
+    return _ok(out, (cands[0].get("finishReason") if cands else None) == "MAX_TOKENS")
 
 
 _OPENAI_LIKE_BASE = {
@@ -355,10 +359,15 @@ async def _openai_like(client, spec, key, system, message, max_tokens, history=N
         headers["X-Title"] = "OmniMed"
     budget = max(max_tokens, OPENAI_LIKE_MAX_TOKENS)
     payload = {"model": spec["id"], "messages": messages, param: budget}
-    if spec["provider"] == "openrouter":
-        payload["reasoning"] = {"max_tokens": REASONING_BUDGET}
 
     r = await _post(client, f"{base}/chat/completions", headers, payload)
+    # A model whose own maximum is lower says so ("must be less than or equal to
+    # `16384`"): retry once at that maximum, so every model gets all it allows.
+    limit = re.search(r"less than or equal to `?(\d+)", r.text) if r.status_code == 400 else None
+    if limit and int(limit.group(1)) < budget:
+        budget = int(limit.group(1))
+        payload[param] = budget
+        r = await _post(client, f"{base}/chat/completions", headers, payload)
     if r.status_code == 400 and "reasoning" in r.text.lower() and "reasoning" in payload:
         payload.pop("reasoning")      # a model that does not reason may reject the field
         r = await _post(client, f"{base}/chat/completions", headers, payload)
@@ -379,7 +388,7 @@ async def _openai_like(client, spec, key, system, message, max_tokens, history=N
     if not text.strip():
         err = "TRUNCATED_BEFORE_ANSWER" if choice.get("finish_reason") == "length" else "EMPTY_RESPONSE"
         return {**out, "status": "error", "error": err}
-    return {**out, "status": "ok"}
+    return _ok(out, choice.get("finish_reason") == "length")
 
 
 async def _cohere(client, spec, key, system, message, max_tokens, history=None):
@@ -388,7 +397,7 @@ async def _cohere(client, spec, key, system, message, max_tokens, history=None):
                     {"Authorization": f"Bearer {key}"},
                     {"model": spec["id"], "messages": messages,
                      "max_tokens": max(max_tokens, OPENAI_LIKE_MAX_TOKENS),
-                     "thinking": {"type": "enabled", "token_budget": REASONING_BUDGET}})
+                     "thinking": {"type": "enabled"}})
     if r.status_code != 200:
         return _failure(r)
     data = r.json()
@@ -401,7 +410,13 @@ async def _cohere(client, spec, key, system, message, max_tokens, history=None):
         # Command A reasons first, in "thinking" blocks that share the budget.
         err = "TRUNCATED_BEFORE_ANSWER" if data.get("finish_reason") == "MAX_TOKENS" else "EMPTY_RESPONSE"
         return {**out, "status": "error", "error": err}
-    return {**out, "status": "ok"}
+    return _ok(out, data.get("finish_reason") == "MAX_TOKENS")
+
+
+def _ok(out: dict, cut_off: bool) -> dict:
+    """An answer. `truncated` when it hit the length limit mid-answer: shown,
+    but marked, since the end (often the citation list) is missing."""
+    return {**out, "status": "ok", **({"truncated": True} if cut_off else {})}
 
 
 _CALLERS = {"anthropic": _anthropic, "google": _gemini, "cohere": _cohere,
@@ -455,17 +470,26 @@ async def call_many(keys: list[str], messages: dict, system: str | None = None,
               for k in keys]))
 
 
-def judge_chain(scored_key: str, requested: str | None = None) -> list[str]:
-    """Judges to try for one answer, never from the scored model's provider.
+def maker(key: str) -> str | None:
+    """Who made the model, which is not always who serves it: GPT-OSS on Groq
+    is OpenAI's, and Qwen is Qwen's on Groq and OpenRouter alike. The model id
+    says so ("openai/gpt-oss-120b"); otherwise the provider is the maker."""
+    spec = MODELS.get(key) or {}
+    mid = spec.get("id") or ""
+    return mid.split("/", 1)[0] if "/" in mid else spec.get("provider")
+
+
+def judge_chain(scored_key: str, requested: str | None = None, scored_maker: str | None = None) -> list[str]:
+    """Judges to try for one answer, never one made by the scored model's maker.
 
     The backend excludes only the scored model itself; this is stricter and
-    excludes its whole provider, since a sibling model shares most of its
+    excludes its whole family, since a sibling model shares most of its
     training and its blind spots.
     """
-    scored_provider = (MODELS.get(scored_key) or {}).get("provider")
+    scored_maker = scored_maker or maker(scored_key)
     chain = []
-    if requested and requested in MODELS and MODELS[requested]["provider"] != scored_provider:
+    if requested and requested in MODELS and maker(requested) != scored_maker:
         chain.append(requested)
     chain += [k for k in JUDGE_PREFERENCE
-              if k not in chain and MODELS[k]["provider"] != scored_provider and available(k)]
+              if k not in chain and maker(k) != scored_maker and available(k)]
     return chain

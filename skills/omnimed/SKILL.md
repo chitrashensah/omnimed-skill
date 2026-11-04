@@ -69,8 +69,10 @@ user wants literature-backed answers, recent evidence, or a time window:
 | The user says | Add |
 |---|---|
 | "use PubMed", "cite recent papers", "evidence-based" | `--db pubmed` |
-| "Europe PMC", "include preprints" | `--db europepmc` |
+| "Europe PMC" | `--db europepmc` (peer-reviewed only; preprints go to the conclusion) |
+| "skip preprints" | `--no-preprints` (by default `compare`/`run` check the latest preprints on the candidates) |
 | "past year / 5 years / 10 years" | `--dates 1y` / `5y` / `10y` (strict: older papers are not cited) |
+| "since 2018" | `--dates 2018` |
 | "give them 8 papers" | `--papers 8` (default `auto`: the model chooses from the 25 best matches) |
 
 Without `--db`, models answer from their own knowledge, which is itself a fair
@@ -80,39 +82,69 @@ PubMed since 2021").
 ### 3. Optionally include your own answer
 
 Only if the user asks for it. Write it **before** looking at any other model's
-answer, following [reference/research-prompt.md](reference/research-prompt.md),
-and save it to a file. In step 4 use `ask` + `add-answer … --provider anthropic
+answer, following the same citation instruction the models get (`python3
+scripts/omnimed.py prompt`) and nothing else, and save it to a file. In step 4 use `ask` + `add-answer … --provider anthropic
 --source host` (or your own provider) + `compare`, so your provider is kept off
 its judge. It counts toward the 5.
 
 ### 4. Run
 
 ```bash
-python3 scripts/omnimed.py run "<question>" --models gemini38,deepseek_pro,groq,qwen38flash,cohere
+python3 scripts/omnimed.py run "<question>" --models gemini38,deepseek_pro,groq,qwen38flash,cohere --judge host
 # with literature:  … --db pubmed --dates 5y
 ```
 
-This asks every model in parallel with OmniMed's research prompt, then checks
-citations and uncited claims, profiles candidates, and judges each answer.
-It typically takes 2–4 minutes; the slowest model sets the pace. Tell the user
-it is running, and use a long timeout (10 minutes).
+This asks every model in parallel, then checks
+citations and uncited claims and profiles candidates. It typically takes 2–4
+minutes; the slowest model sets the pace. Tell the user it is running, and use
+a long timeout (10 minutes).
+
+### 4b. Score the answers yourself, blind
+
+With `--judge host`, **you** score every answer, at no API cost. A Claude
+answer is also scored by GPT-5.5 (you may favour your own style even unnamed);
+its shown score is the average of the two. The output gives a `judge_packet`
+path: the answers as A, B, C… in random order, with the rubric and their
+citation-check facts. Score them **before** reading `report.md` or anything
+else that names the models:
+
+1. Read `judge_packet.md` and follow its instructions; score each answer on its own.
+2. Write the JSON object it asks for to a file, then:
+   ```bash
+   python3 scripts/omnimed.py add-scores <run> <scores-file>
+   ```
+
+Score each answer on its own merits, including any you suspect is Claude's. If
+GPT-5.5 could not score (no key, out of credit), the Claude answers carry your
+score only; the report says so.
 
 ### 5. Write the verdict and show the conversation view
 
 Read `report.md` from the run directory, then write a short verdict
-(3–6 sentences or bullets) to a file. It is the conclusion comparing the
-answers; base it on the report and the answers, not on your own review of the
-cited papers (the checker does that; open papers only if the user asks):
+(4–8 bullets) to a file. It is a scientific conclusion about the **candidates**,
+for a researcher deciding what to test. Citation quality is already shown in
+each answer's box and the scoreboard: do not list PMIDs or retell citation
+problems here, and do not review the cited papers yourself.
 
-- Lead with the single most important finding.
-- Rank candidates by the **strength of independent evidence** (papers, trials,
-  verified citations), not by how many models named them. Models share
-  training data and are wrong together.
-- Name real disagreements between models, and say which answers had fabricated
-  or off-topic citations.
-- Trial counts include any study listing the RNA as an intervention; say so
-  if you lean on them.
-- If a date range was set, mention any citation the report flags as older than it.
+- **Agreed:** candidates most models named, with the same direction
+  (overexpress ↑ / knock down ↓) and the same disease model.
+- **Disagreed:** candidates named with opposite directions or different
+  mechanisms, and which models said what.
+- **Only one model:** notable candidates the others missed.
+- **Latest preprints:** from report.md's "Latest preprints" section (OmniMed's
+  own search; the models never saw these). For each preprint that bears on a
+  candidate, say whether it **supports** or **contradicts** it, citing it by
+  its ID (`P3`). Name any candidate found only in preprints. Label all of them
+  "preprint, not peer-reviewed", and never raise a candidate's rank on a
+  preprint alone. If the search was unavailable, say so in one line.
+- **Test first in the lab:** 2–4 candidates, ranked by the strength of
+  independent evidence (the candidates table's papers and trials), not by how
+  many models named them, since models share training data and are wrong
+  together. For each: direction (mimic / inhibitor), model system and a
+  readout, plus the main risk. A contradicting preprint is a risk worth naming.
+  End with: "Suggestions, not validated results."
+- One line, only if it changes the picture: an answer that was cut off or whose
+  citations mostly failed is weaker evidence for what it alone proposed.
 - If your own answer is in the comparison, say so and do not rank it above the others.
 
 Then put it in the **Conclusion** box and show the conversation view: the
@@ -120,16 +152,12 @@ website's layout, each model in its own coloured box with badges for citations
 and judge score, problems highlighted, every answer in full. Follow-ups are
 added to the same page (earlier questions collapsed), like the website's chat.
 
-- **If you have an Artifact tool** (the Claude desktop app), show it beside the
-  chat, not in a separate browser:
-  ```bash
-  python3 scripts/omnimed.py add-verdict <run> <verdict-file> --no-open
-  ```
-  then publish the `conversation_html` path it prints as an artifact (icon
-  `chart`). It is one file per conversation, so for a follow-up publish the
-  same path again: the same panel updates instead of a new one opening.
-- **Otherwise** (terminal): `add-verdict <run> <verdict-file>` opens it in the
-  default browser.
+```bash
+python3 scripts/omnimed.py add-verdict <run> <verdict-file>
+```
+
+This opens the conversation in the user's browser (Chrome or their default).
+A follow-up opens it again, with the new question added.
 
 ### 6. Present in chat
 
@@ -139,8 +167,8 @@ Show, in this order:
 2. The **Scoreboard** table from `report.md`, exactly as written.
 3. Problems, one line per model (e.g. "GPT-OSS: 1 off-topic citation"). The
    details are in the conversation view.
-4. One line: the side-by-side answers are in the conversation view (beside the
-   chat, or in the browser); you can paste any answer or the candidates table on request.
+4. One line: the side-by-side answers are open in the browser; you can paste
+   any answer or the candidates table on request.
 
 Then stop. Do not start other work in the same turn: no re-checking papers by
 hand, no changes to OmniMed's code, no commits. If a result looks wrong (say, a
@@ -148,7 +176,7 @@ citation flagged off-topic that seems on-topic), say so in one line and let the
 user decide.
 
 Never summarise or paraphrase a model's answer in place of showing it. If the
-view could not be shown (no artifact, `opened_in_browser: false`) or the user
+browser did not open (`opened_in_browser: false`) or the user
 prefers the chat, show every answer in full under its model name instead.
 
 End by asking if they want to swap any models, and mention that wet-lab results
@@ -160,13 +188,14 @@ A follow-up question ("give me the citations again", "what about in vivo?",
 "which of these has trial data?") continues the conversation:
 
 ```bash
-python3 scripts/omnimed.py run "<follow-up>" --models <same models> --after <previous run> [--db … --dates …]
+python3 scripts/omnimed.py run "<follow-up>" --models <same models> --after <previous run> --judge host [--db … --dates …]
 ```
 
 Each model gets **its own** earlier questions and answers as history, never
 another model's, so the answers stay independent. A model that was not in the
-earlier run is told the earlier questions only. Then present as in steps 5–6;
-`conversation_html` is the same file as before, now with this question added.
+earlier run is told the earlier questions only. Use `--judge host` and
+score it (step 4b), then present as in steps 5–6; the browser page is the same
+conversation, now with this question added.
 
 ## Switching models
 
@@ -175,12 +204,15 @@ citation checks and judge scores. Only the new models are asked and checked.
 
 | The user says | Do |
 |---|---|
-| "Add Qwen 3.8 Max" | `ask "<question>" --models qwen38max0902 --run <run>`, then `compare <run>` |
+| "Add Qwen 3.8 Max" | `ask "<question>" --models qwen38max0902 --run <run>`, then `compare <run> --judge host` (and step 4b) |
 | "Drop Cohere" | `remove-answer <run> cohere`, then `compare <run>` |
 | "Swap Cohere for GPT-5.5" | `remove-answer <run> cohere`, `ask … --models gpt55 --run <run>`, `compare <run>` |
 | "Retry the one that failed" | `ask … --models <that key> --run <run>`, then `compare <run>` |
 | "Use these by default from now on" | `defaults gemini38,deepseek_pro,gpt55` |
 | "Back to the normal defaults" | `defaults --reset` |
+
+Every `compare` here takes `--judge host`; only answers that changed are in the
+new packet, so score just those (step 4b).
 
 A run holds at most 5 models: when adding would exceed that, ask which to drop
 first. After any change, write a fresh verdict (`add-verdict`): `compare`
@@ -218,8 +250,8 @@ it that.
 ## Workflow D: your own grounded answer
 
 1. `search` the topic (one or two focused queries).
-2. Write the answer following [reference/research-prompt.md](reference/research-prompt.md)
-   (the same base prompt and research format the website gives every model).
+2. Write the answer in your own way, citing as the models are told to
+   (`python3 scripts/omnimed.py prompt`).
    Cite PMIDs from the search results; if the user set a date range, only papers
    within it.
 3. Save your draft to a file and run `verify` on it. Fix or remove every
@@ -227,10 +259,11 @@ it that.
 
 ## Rules
 
-- **Your own answers follow [reference/research-prompt.md](reference/research-prompt.md)**, the same rules the models get: cite findings by PMID with a link, never invent an identifier.
+- **Models get no answer format.** They are told only how to cite (`prompt` shows it), so each answers in its own words and structure. Your own answers follow the same citation rule: cite findings by PMID with a link, never invent an identifier.
 - **Never read, print or copy API keys or env files.** `setup` shows which keys exist as true/false only.
 - **Keep the three layers separate.** Never average citation results, judge score and wet-lab verdict into one number.
-- **The judge is never the model's own provider.** The script enforces this. Do not override it with `--judge` to a same-provider model.
+- **You judge blind.** Score from `judge_packet.md` before you see model names, never after.
+- **You judge every answer, blind; GPT-5.5 adds a second score to Claude answers only.** No other model judges.
 - **Judge scores are noisy.** The same answer can score very differently on a re-run. Present them as one reviewer's opinion, not a measurement.
 - **Errors are information.** If a model fails, show its error in plain words (see below), carry on with the rest, and offer to retry it.
 
@@ -242,6 +275,7 @@ it that.
 | `INSUFFICIENT_CREDITS` | The provider account behind this model is out of credit |
 | `SERVICE_UNAVAILABLE` | Provider overloaded (already retried once) |
 | `MODEL_UNAVAILABLE` | Provider no longer serves this model id |
+| `REFUSED` | A safety classifier declined the request before the model ran, not a judgement on the question. Every Claude 5 model runs them and `bio` (research biology) fires on ordinary ncRNA questions. Say which area was named, and offer the same question on another Claude model or a non-Claude one |
 | `TRUNCATED_BEFORE_ANSWER` | Model spent its whole budget thinking |
 | `NETWORK_ERROR` | Connection dropped (already retried once); retrying usually works |
 | `TIMEOUT` | No answer within 5 minutes |

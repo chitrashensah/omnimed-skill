@@ -15,7 +15,7 @@ JSON gives the paths.
   new-run QUESTION              start an empty run (for pasted or host answers)
   add-answer RUN --label L FILE add an answer from elsewhere (the host, a paste)
   remove-answer RUN a,b         drop models from a run (then compare again)
-  compare RUN [--judge auto]    verify, profile candidates, judge, write report.md/.html
+  compare RUN [--judge auto]    verify, profile candidates, latest preprints, judge, write report.md/.html
   run QUESTION --models a,b     ask + compare in one step (at most 5 models)
   add-verdict RUN FILE          put the host's verdict in the Conclusion box, open the page
   open RUN                      open a run's report.html in the browser
@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -36,7 +37,6 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SKILL_DIR = HERE.parent
 VENV_DIR = Path(os.path.expanduser("~/.cache/omnimed/venv"))
-RESEARCH_PROMPT = SKILL_DIR / "reference" / "research-prompt.md"
 
 
 def _ensure_deps():
@@ -127,8 +127,10 @@ def for_analysis(text: str) -> str:
     return (text or "").translate(_HYPHENS)
 
 
-def research_prompt() -> str:
-    return RESEARCH_PROMPT.read_text(encoding="utf-8").strip()
+def system_prompt() -> str:
+    """What every model is told: how to cite, so citations can be checked.
+    Nothing about format, depth or what to answer; each model answers its own way."""
+    return grounding.CITATION_PROMPT
 
 
 def parse_models(spec: str | None) -> list[str]:
@@ -326,6 +328,13 @@ def cmd_unsourced(args):
     emit({"status": "ok", **asyncio.run(lit.check_unsourced_claims(for_analysis(read_text(args.file))))})
 
 
+def _dates(v: str) -> str:
+    """1y, 5y, 10y, all, or a start year such as 2018."""
+    if v in grounding.LITERATURE_RANGES or (v.isdigit() and 1900 <= int(v) <= datetime.now().year):
+        return v
+    raise argparse.ArgumentTypeError(f"use {', '.join(grounding.LITERATURE_RANGES)} or a year such as 2018")
+
+
 def literature_options(args) -> dict:
     """The website's per-box options (database, date range, papers), for all
     models in this run. Empty when no database was chosen."""
@@ -367,7 +376,7 @@ def _ask(question: str, keys: list[str], run: Path | None, use_prompt: bool,
             missed[k] = unseen
     lit_map = grounding.parse_literature({k: literature for k in keys}, keys) if literature else {}
     previous = chain[-1][0] if chain else ""
-    system = research_prompt() if use_prompt else None
+    system = system_prompt() if use_prompt else None
 
     async def go():
         search_for = grounding.literature_searcher(question, lit_map, previous)
@@ -441,15 +450,36 @@ def cmd_add_answer(args):
           "provider": meta_provider})
 
 
-async def _judge_one(question: str, ans: dict, verification: dict, requested: str | None) -> dict:
-    scored_provider = ans.get("provider")
-    chain = [k for k in models.judge_chain(ans["model"], requested)
-             if models.MODELS[k]["provider"] != scored_provider]
+def _provider(ans: dict) -> str | None:
+    """The answer's maker: as given for a pasted answer, else from its model."""
+    if ans.get("provider") and ans["model"] not in models.MODELS:
+        return ans["provider"]
+    return models.maker(ans["model"]) or ans.get("provider")
+
+
+def shared_judges(answers: list[dict], requested: str | None) -> list[str]:
+    """Judges from a provider none of the answers came from, best first.
+
+    One judge for every answer, as on the website: scores from different
+    judges are not comparable, and the scoreboard puts them side by side.
+    """
+    used = {_provider(a) for a in answers}
+    keys = ([requested] if requested else []) + list(models.JUDGE_PREFERENCE)
+    return [k for k in dict.fromkeys(keys)
+            if k in models.MODELS and models.maker(k) not in used and models.available(k)]
+
+
+async def _judge_one(question: str, ans: dict, verification: dict, requested: str | None,
+                     shared: list[str] | None = None) -> dict:
+    # The shared judges first; if none is left out of the comparison, or all of
+    # them fail (out of credit, rate limited), one per answer from another maker.
+    own = models.judge_chain(ans["model"], requested, _provider(ans))
+    chain = list(dict.fromkeys((shared or []) + own))
     if not chain:
         return {"error": "NO_JUDGE_AVAILABLE", "tried": []}
     prompt = rubric.build_judge_prompt(question, ans["text"], verification)
     tried = []
-    for judge in chain[:4]:
+    for judge in chain[:6]:
         res = await models.call(judge, prompt, rubric.JUDGE_SYSTEM, JUDGE_REPLY_TOKENS, JUDGE_TIMEOUT)
         tried.append({"judge": judge, "status": res["status"], "error": res.get("error")})
         if res["status"] != "ok":
@@ -471,7 +501,7 @@ def _text_hash(text: str) -> str:
 
 
 async def _compare(question: str, answers: list[dict], judge_mode: str,
-                   previous: dict | None = None) -> dict:
+                   previous: dict | None = None, preprints: bool = True) -> dict:
     ok = [a for a in answers if a.get("status") == "ok" and (a.get("text") or "").strip()]
 
     # Swapping one model in a run should not re-check the other four. An
@@ -487,8 +517,8 @@ async def _compare(question: str, answers: list[dict], judge_mode: str,
     for a in ok:
         a["text_hash"] = _text_hash(a["text"])
         old = prior.get(a["model"])
-        if old and old["text_hash"] == a["text_hash"] and (judge_mode == "none" or old.get("judge")):
-            for k in ("verification", "unsourced", "judge"):
+        if old and old["text_hash"] == a["text_hash"] and (judge_mode in ("none", "host") or old.get("judge")):
+            for k in ("verification", "unsourced", "judge", "judges"):
                 if old.get(k) is not None:
                     a[k] = old[k]
             if judge_mode == "none":
@@ -504,20 +534,46 @@ async def _compare(question: str, answers: list[dict], judge_mode: str,
         a["verification"] = v if isinstance(v, dict) else {"error": str(v)[:200]}
         a["unsourced"] = u if isinstance(u, dict) else {"error": str(u)[:200]}
 
-    try:
-        profiles = await lit.profile_candidates({a["model"]: for_analysis(a["text"]) for a in ok}, question)
-    except Exception:
-        profiles = []
+    # Candidate profiles, and the latest preprints on those candidates for the
+    # conclusion (the models answer from peer-reviewed papers only).
+    texts = {a["model"]: for_analysis(a["text"]) for a in ok}
+    named = lit.extract_candidates(texts)
+    order = sorted(named, key=lambda k: (-len(named[k]), k))
+    jobs = [lit.profile_candidates(texts, question)]
+    if preprints:
+        jobs.append(lit.scan_preprints(order, grounding.topic_terms(question)))
+    settled = await asyncio.gather(*jobs, return_exceptions=True)
+    profiles = settled[0] if isinstance(settled[0], list) else []
+    scan = None
+    if preprints:
+        scan = settled[1] if isinstance(settled[1], dict) else {"preprints": {}, "unavailable": True}
 
-    if judge_mode != "none":
+    if judge_mode == "host":
+        for a in ok:
+            if a in fresh:
+                a.pop("judge", None)
+                a.pop("judges", None)
+        await _gpt_judge(question, ok)
+        for a in ok:
+            combine_judges(a)
+    elif judge_mode != "none":
         requested = None if judge_mode == "auto" else models.resolve(judge_mode)
-        to_judge = [a for a in ok if a in fresh or not a.get("judge")]
-        judged = await asyncio.gather(*[_judge_one(question, a, a.get("verification"), requested)
+        shared = shared_judges(ok, requested)
+        # A kept score from a different judge would not be comparable: re-judge it.
+        to_judge = [a for a in ok if a in fresh or not a.get("judge")
+                    or (shared and (a.get("judge") or {}).get("judge") not in shared)]
+        judged = await asyncio.gather(*[_judge_one(question, a, a.get("verification"), requested, shared)
                                         for a in to_judge], return_exceptions=True)
         for a, j in zip(to_judge, judged):
             a["judge"] = j if isinstance(j, dict) else {"error": str(j)[:200]}
 
-    return {"question": question, "answers": answers, "candidates": profiles}
+    comp = {"question": question, "answers": answers, "candidates": profiles,
+            "judge_mode": judge_mode}
+    if scan is not None:
+        comp["preprints"] = scan
+    if judge_mode == "host":
+        comp["judge_note"] = judge_note(comp)
+    return comp
 
 
 def _write_comparison(run: Path, comp: dict) -> dict:
@@ -544,7 +600,7 @@ def _write_comparison(run: Path, comp: dict) -> dict:
             "miscitation_rate": v.get("miscitation_rate"),
             "uncited_claims_unsupported": (a.get("unsourced") or {}).get("none_found"),
             "judge": j.get("judge"), "judge_score": (j.get("score") or {}).get("overall"),
-            "judge_error": j.get("error"),
+            "judge_error": j.get("error"), "truncated": bool(a.get("truncated")),
         })
     return {"status": "ok", "run": str(run), "report": str(run / "report.md"),
             "report_html": str(run / "report.html"),
@@ -553,7 +609,17 @@ def _write_comparison(run: Path, comp: dict) -> dict:
             "candidates": [{"name": p.get("name"), "named_by": p.get("proposed_by"),
                             "papers": p.get("papers"), "papers_recent": p.get("papers_recent"),
                             "trials": p.get("trials")} for p in comp.get("candidates") or []],
+            "preprints": _preprint_summary(comp.get("preprints")),
             "scoreboard": summary}
+
+
+def _preprint_summary(scan: dict | None) -> dict | None:
+    if scan is None:
+        return None
+    return {"found": len(scan.get("preprints") or {}), "since": scan.get("since"),
+            "on_candidates": {k: len(v) for k, v in (scan.get("by_candidate") or {}).items()},
+            "new_candidates": [n["name"] for n in scan.get("new") or []],
+            "unavailable": bool(scan.get("unavailable"))}
 
 
 def _previous(run: Path) -> dict | None:
@@ -572,7 +638,120 @@ def open_in_browser(path: Path) -> bool:
         return False
 
 
+# ── Judging: Claude, plus GPT on Claude answers ────────────────────────────
+# Claude (the host, on the user's plan) scores every answer, blind: it gets
+# them as A, B, C… in random order. A Claude answer is also scored by GPT-5.5,
+# since Claude may favour its own style even unnamed; its shown score is the
+# average of the two. No other model judges, and nothing else costs API money.
+GPT_JUDGE = "gpt55"
+
+
+def _needs_host(a: dict) -> bool:
+    return not ((a.get("judges") or {}).get("host") or {}).get("score")
+
+
+async def _gpt_judge(question: str, ok: list[dict]):
+    todo = [a for a in ok if _provider(a) == "anthropic" and "gpt" not in (a.get("judges") or {})]
+    if not todo:
+        return
+    if not models.available(GPT_JUDGE):
+        for a in todo:
+            a.setdefault("judges", {})["gpt"] = {"judge": GPT_JUDGE, "error": "NO_API_KEY"}
+        return
+    replies = await asyncio.gather(*[
+        models.call(GPT_JUDGE, rubric.build_judge_prompt(question, a["text"], a.get("verification")),
+                    rubric.JUDGE_SYSTEM, JUDGE_REPLY_TOKENS, JUDGE_TIMEOUT) for a in todo],
+        return_exceptions=True)
+    for a, res in zip(todo, replies):
+        if isinstance(res, Exception) or res.get("status") != "ok":
+            err = str(res)[:200] if isinstance(res, Exception) else res.get("error")
+            a.setdefault("judges", {})["gpt"] = {"judge": GPT_JUDGE, "error": err}
+            continue
+        score = rubric.parse_judge_reply(res.get("text") or "")
+        a.setdefault("judges", {})["gpt"] = {
+            "judge": GPT_JUDGE, "judge_label": res["label"], "judge_served_model": res.get("served_model"),
+            **({"score": score} if score else {"error": "UNPARSEABLE"})}
+
+
+def combine_judges(a: dict):
+    """The answer's shown score: one judge's, or the average of both."""
+    judges = a.get("judges") or {}
+    good = [j for j in judges.values() if j.get("score")]
+    if not good:
+        errs = [j for j in judges.values() if j.get("error")]
+        if errs:
+            a["judge"] = {"judge": errs[0].get("judge"), "error": errs[0]["error"]}
+        else:
+            a.pop("judge", None)
+        return
+    avg = lambda xs: round(sum(xs) / len(xs)) if xs else None
+    scores = {d: avg([j["score"]["scores"][d] for j in good if j["score"]["scores"].get(d) is not None])
+              for d in rubric.DIMENSIONS}
+    flags = list(dict.fromkeys(f for j in good for f in j["score"].get("red_flags") or []))[:6]
+    a["judge"] = {
+        "judge": "+".join(j["judge"] for j in good),
+        "judge_label": " + ".join(j.get("judge_label") or j["judge"] for j in good),
+        "score": {"overall": avg([j["score"]["overall"] for j in good]), "scores": scores,
+                  "rationale": " ".join((f"{j.get('judge_label')}: " if len(good) > 1 else "")
+                                        + j["score"].get("rationale", "") for j in good),
+                  "red_flags": flags},
+    }
+
+
+def judge_note(comp: dict) -> str | None:
+    """Says how the Claude answers were scored, with both judges' numbers."""
+    claude = [a for a in comp["answers"] if a.get("status") == "ok" and _provider(a) == "anthropic"]
+    if not claude:
+        return "Scored by Claude, blind (answers shown to it as A, B, C… without model names)."
+    parts = []
+    for a in claude:
+        j = a.get("judges") or {}
+        host = ((j.get("host") or {}).get("score") or {}).get("overall")
+        gpt = ((j.get("gpt") or {}).get("score") or {}).get("overall")
+        gpt_txt = f"GPT-5.5 {gpt}/10" if gpt is not None else \
+            f"GPT-5.5 unavailable ({(j.get('gpt') or {}).get('error', 'not run')})"
+        parts.append(f"{a.get('label')}: Claude {host if host is not None else '—'}/10, {gpt_txt}")
+    return ("Scored by Claude, blind. Claude may favour its own style even unnamed, so Claude "
+            "answers were also scored by GPT-5.5 and show the average: " + "; ".join(parts) + ".")
+
+
+def write_judge_packet(run: Path, comp: dict) -> Path | None:
+    """The answers still to score, anonymised and shuffled, for the host to
+    judge before it sees which model wrote which. None if nothing is pending."""
+    pending = [a for a in comp["answers"] if a.get("status") == "ok"
+               and (a.get("text") or "").strip() and _needs_host(a)]
+    comp.pop("host_judge", None)
+    if comp.get("judge_mode") != "host" or not pending:
+        return None
+    random.shuffle(pending)
+    letters = [chr(ord("A") + i) for i in range(len(pending))]
+    comp["host_judge"] = {"map": {l: a["model"] for l, a in zip(letters, pending)}}
+    intro = rubric.JUDGE_SYSTEM.split("Reply with ONLY")[0].replace(
+        "You are scoring one candidate answer", "You are scoring each candidate answer below, independently,")
+    parts = [intro.strip() + "\nEvery score is an integer from 1 to 10; `red_flags` lists specific "
+             "problems and is [] if there are none.",
+             f"RESEARCH QUESTION:\n{comp['question']}",
+             "Score on each criterion:\n" + "\n".join(f"- {k}: {d}" for k, d in rubric.RUBRIC)]
+    for l, a in zip(letters, pending):
+        parts.append(f"## Answer {l}\n\n{rubric._shorten(a['text'], rubric.MAX_ANSWER_CHARS)}\n\n"
+                     f"{rubric._verification_digest(a.get('verification'))}")
+    parts.append('Reply with ONE JSON object keyed by letter, e.g. {"A": {"evidence": N, '
+                 '"mechanism": N, "actionability": N, "calibration": N, "rationale": "…", '
+                 '"red_flags": []}, "B": {…}}')
+    page = run / "judge_packet.md"
+    page.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+    return page
+
+
 def _finish(run: Path, comp: dict, want_open: bool):
+    packet = write_judge_packet(run, comp)
+    if packet:
+        out = _write_comparison(run, comp)
+        out["judge_packet"] = str(packet)
+        out["next"] = ("Score the answers yourself: read judge_packet.md (and nothing else about "
+                       f"this run yet), then `add-scores {run} <scores.json>`. Then the verdict.")
+        emit(out)
+        return
     out = _write_comparison(run, comp)
     if want_open:
         out["opened_in_browser"] = open_in_browser(Path(out["conversation_html"]))
@@ -584,7 +763,8 @@ def cmd_compare(args):
     question, answers = load_run(run)
     if not answers:
         fail("NO_ANSWERS", f"No answers in {run}/answers. Use `ask` or `add-answer` first.")
-    comp = asyncio.run(_compare(question, answers, args.judge, _previous(run)))
+    comp = asyncio.run(_compare(question, answers, args.judge, _previous(run),
+                                not args.no_preprints))
     _finish(run, comp, args.open)
 
 
@@ -593,8 +773,46 @@ def cmd_run(args):
     run, _ = _ask(args.question, keys, None, not args.no_prompt, literature_options(args),
                   Path(args.after).expanduser() if args.after else None)
     question, answers = load_run(run)
-    comp = asyncio.run(_compare(question, answers, args.judge))
+    comp = asyncio.run(_compare(question, answers, args.judge, preprints=not args.no_preprints))
     _finish(run, comp, args.open)
+
+
+def cmd_prompt(args):
+    emit({"status": "ok", "system_prompt": system_prompt()})
+
+
+def cmd_add_scores(args):
+    """Record the host's blinded scores from judge_packet.md."""
+    run = Path(args.run).expanduser()
+    comp = _previous(run)
+    letters = (comp or {}).get("host_judge", {}).get("map")
+    if not letters:
+        fail("NO_PACKET", f"No judge packet pending in {run}; run `compare {run} --judge host` first.")
+    try:
+        replies = json.loads(read_text(args.file))
+    except ValueError as e:
+        fail("BAD_SCORES", f"Scores must be one JSON object keyed by letter: {e}")
+    by_model = {a["model"]: a for a in comp["answers"]}
+    scored, missing = [], []
+    for letter, model in letters.items():
+        score = rubric.parse_judge_reply(json.dumps(replies.get(letter) or {}))
+        if not score:
+            missing.append(letter)
+            continue
+        by_model[model].setdefault("judges", {})["host"] = {
+            "judge": "host", "judge_label": args.by, "score": score, "blinded": True}
+        scored.append(model)
+    if missing:
+        fail("BAD_SCORES", f"No usable scores for answer(s) {', '.join(missing)}; nothing was saved.")
+    comp.pop("host_judge", None)
+    for a in comp["answers"]:
+        if a.get("judges"):
+            combine_judges(a)
+    comp["judge_note"] = judge_note(comp)
+    out = _write_comparison(run, comp)
+    out["scored"] = scored
+    out["next"] = "Now read report.md and write the verdict (add-verdict)."
+    emit(out)
 
 
 def cmd_add_verdict(args):
@@ -658,16 +876,17 @@ def main():
     p.add_argument("file", nargs="?", default="-")
     p.set_defaults(fn=cmd_unsourced)
 
-    judge_help = "auto (default): best available judge from another provider; none; or a model key"
+    judge_help = ("auto (default): best available API judge from another provider; host: you "
+                  "score the answers blind from judge_packet.md (no API cost); none; or a model key")
 
     p = sub.add_parser("ask")
     p.add_argument("question")
     p.add_argument("--models", help="comma list of model keys or names; 'default' for the free set")
     p.add_argument("--run", help="existing run directory to add answers to")
-    p.add_argument("--no-prompt", action="store_true", help="send the question without OmniMed's research prompt")
+    p.add_argument("--no-prompt", action="store_true", help="send the question without the citation instruction")
     p.add_argument("--db", choices=grounding.LITERATURE_DATABASES,
                    help="give every model papers from this database for the question")
-    p.add_argument("--dates", default="all", choices=list(grounding.LITERATURE_RANGES),
+    p.add_argument("--dates", default="all", type=_dates,
                    help="only papers from the last 1, 5 or 10 years (strict: older ones are not cited)")
     p.add_argument("--papers", default="auto",
                    help="'auto' (the model chooses from the 25 best matches) or a number, at most 25")
@@ -697,14 +916,24 @@ def main():
     p.add_argument("run")
     p.add_argument("--judge", default="auto", help=judge_help)
     p.add_argument("--open", action="store_true", help="open report.html in the browser")
+    p.add_argument("--no-preprints", action="store_true",
+                   help="skip the latest-preprints check for the conclusion")
     p.set_defaults(fn=cmd_compare)
 
     p = sub.add_parser("add-verdict", help="put your verdict in the report's Conclusion box")
     p.add_argument("run")
     p.add_argument("file", nargs="?", default="-")
     p.add_argument("--by", default="Claude (host)", help="who wrote the verdict")
-    p.add_argument("--no-open", action="store_true")
+    p.add_argument("--no-open", action="store_true", help="do not open the page in the browser")
     p.set_defaults(fn=cmd_add_verdict)
+
+    sub.add_parser("prompt", help="show the instruction every model gets").set_defaults(fn=cmd_prompt)
+
+    p = sub.add_parser("add-scores", help="record your blinded scores from judge_packet.md")
+    p.add_argument("run")
+    p.add_argument("file", nargs="?", default="-")
+    p.add_argument("--by", default="Claude (host)", help="who scored")
+    p.set_defaults(fn=cmd_add_scores)
 
     p = sub.add_parser("open", help="open the conversation view (all turns) in the browser")
     p.add_argument("run")
@@ -718,11 +947,13 @@ def main():
     p.add_argument("--open", action="store_true", help="open report.html in the browser")
     p.add_argument("--db", choices=grounding.LITERATURE_DATABASES,
                    help="give every model papers from this database for the question")
-    p.add_argument("--dates", default="all", choices=list(grounding.LITERATURE_RANGES),
+    p.add_argument("--dates", default="all", type=_dates,
                    help="only papers from the last 1, 5 or 10 years (strict: older ones are not cited)")
     p.add_argument("--papers", default="auto",
                    help="'auto' (the model chooses from the 25 best matches) or a number, at most 25")
     p.add_argument("--after", help="previous run this question follows up; each model gets its own earlier answers")
+    p.add_argument("--no-preprints", action="store_true",
+                   help="skip the latest-preprints check for the conclusion")
     p.set_defaults(fn=cmd_run)
 
     args = ap.parse_args()

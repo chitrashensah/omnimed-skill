@@ -8,7 +8,7 @@ Ask a cardiovascular ncRNA research question in your AI chat, and OmniMed:
 - **asks up to 5 AI models in parallel**, picked with checkboxes in the chat from the same 23 models the website offers
 - **grounds them in the literature** when you want: papers from PubMed or Europe PMC, within a date range, cited inline
 - **follows up**: each model keeps its own earlier answers, never another model's
-- **shows the answers laid out like the website**, beside the chat in the Claude app (or in the browser from the terminal): one coloured box per model, every answer in full, a Conclusion box, and follow-ups added to the same page
+- **opens the answers in your browser, laid out like the website**: one coloured box per model, every answer in full, a Conclusion box, and follow-ups added to the same page
 - **checks every citation** against PubMed, Crossref, DataCite and the paper's open full text: fabricated PMIDs, real papers cited for the wrong claim, retractions, papers older than your date range
 - **looks for literature behind uncited claims**
 - **profiles every candidate** miRNA/lncRNA against PubMed and ClinicalTrials.gov, independently of what the models said
@@ -149,9 +149,7 @@ python3 $S search "miR-29 cardiac fibrosis" --year-from 2018
 Runs are saved to `~/omnimed-runs/<timestamp>-<question>/` with every answer,
 `comparison.json`, `report.md` and `report.html`; the first run of a conversation
 also holds `conversation.html`, every question on one page (reopen it with
-`omnimed.py open <run>`). From the terminal the page stays a local file. In the
-Claude app it is shown as a private artifact beside the chat, which stores the
-page on your claude.ai account.
+`omnimed.py open <run>`). The page is a local file; nothing is uploaded.
 
 ## Cost
 
@@ -171,7 +169,7 @@ omnimed-skill/
 ├── docs/SYSTEM_DESIGN.md    architecture, data flow, shared code, release
 ├── skills/omnimed/
 │   ├── SKILL.md             what Claude reads: workflows and rules
-│   ├── reference/           research prompt (generated), how to read results
+│   ├── reference/           how to read results
 │   └── scripts/
 │       ├── omnimed.py       the CLI (one JSON object per command)
 │       ├── sync_from_backend.sh
@@ -192,7 +190,7 @@ The three shared modules live in the [website's backend](https://github.com/chit
 the skill ground a question, check a citation and score an answer the same way.
 After changing any of them there, run `skills/omnimed/scripts/sync_from_backend.sh`
 (it looks for the website checked out next to this repo as `../nexora`, or pass
-the backend path); it also regenerates the research prompt. A test fails if the
+the backend path). A test fails if the
 copies drift. Model keys match the website's `validations.model` keys, so data
 from both can be pooled.
 

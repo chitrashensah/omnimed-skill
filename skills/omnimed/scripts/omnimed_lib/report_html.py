@@ -49,6 +49,7 @@ def _payload(comp: dict) -> dict:
             "error": a.get("error"), "detail": a.get("detail"),
             "seconds": a.get("seconds"), "source": a.get("source"),
             "served_model": a.get("served_model"), "text": a.get("text") or "",
+            "truncated": bool(a.get("truncated")),
             "color": spec.get("color", "#475569"), "bg": spec.get("bg", "#f1f5f9"),
             "tier": spec.get("tier"),
             "cites": {k: v.get(k) for k in ("checked", "verified", "fabricated", "mismatched",
@@ -64,7 +65,9 @@ def _payload(comp: dict) -> dict:
         })
     return {"question": comp.get("question", ""), "run_id": comp.get("run_id", ""),
             "created": comp.get("created", ""), "answers": answers,
-            "candidates": comp.get("candidates") or [], "verdict": comp.get("verdict")}
+            "candidates": comp.get("candidates") or [], "verdict": comp.get("verdict"),
+            "preprints": comp.get("preprints"),
+            "judge_note": comp.get("judge_note")}
 
 
 def render_conversation(comps: list[dict]) -> str:
@@ -144,13 +147,14 @@ th { font-weight: 600; color: var(--text-muted); font-size: 12px; }
 .chip.ok { background: var(--ok-bg); color: var(--ok); }
 .chip.bad { background: var(--bad-bg); color: var(--bad); }
 .chip.warn { background: var(--warn-bg); color: var(--warn); }
-.flags { margin: 8px 10px 0; padding: 8px 10px; border-radius: 6px; background: var(--bad-bg); font-size: 12px; }
+.flags { margin: 0 10px 10px; padding: 8px 10px; border-radius: 6px; background: var(--bad-bg); font-size: 12px; }
 .flags ul { margin: 4px 0 0; padding-left: 18px; }
 .flags b { color: var(--bad); }
 .mbody { padding: 10px 12px; overflow: auto; max-height: 70vh; overflow-wrap: anywhere; }
 .expanded .mbody { max-height: none; }
 .mbody h1, .mbody h2, .mbody h3, .mbody h4 { font-family: var(--font-display); font-size: 15px; margin: 14px 0 6px; }
-.mbody table { font-size: 12px; }
+.mbody table { font-size: 12px; display: block; overflow-x: auto; }
+.mbody th, .mbody td { min-width: 90px; }
 .mbody code { font-family: var(--font-mono); font-size: 12px; }
 .mbody pre.plain { white-space: pre-wrap; font-family: var(--font-body); margin: 0; }
 .mjudge { border-top: 1px solid var(--panel-border); padding: 8px 12px; font-size: 12px; color: var(--text-muted); }
@@ -245,7 +249,7 @@ details.turn[open] > summary .turn-q::after { content: ' · hide'; }
     t.answers.forEach(function (a) {
       var c = a.cites || {}, ok = a.status === 'ok', has = ok && c.checked;
       row(score, [
-        a.label,
+        a.label + (a.truncated ? ' (cut off)' : ''),
         !ok ? 'failed: ' + a.error : (c.checked ? c.verified + ' / ' + c.checked : 'none cited'),
         has ? String(c.fabricated) : '—', has ? String(c.mismatched) : '—', has ? String(c.retracted || 0) : '—',
         ok && a.unsourced && a.unsourced.checked ? a.unsourced.none_found + ' of ' + a.unsourced.checked : '—',
@@ -253,6 +257,7 @@ details.turn[open] > summary .turn-q::after { content: ' · hide'; }
         a.seconds ? a.seconds + 's' : '—'
       ]);
     });
+    if (t.judge_note) sp.node.appendChild(el('p', 'note', t.judge_note));
     turn.appendChild(sp.node);
 
     // Candidates
@@ -271,6 +276,9 @@ details.turn[open] > summary .turn-q::after { content: ' · hide'; }
       });
     }
     turn.appendChild(cp.node);
+
+    // Latest preprints, for the conclusion: OmniMed's search, not the models'
+    if (t.preprints) turn.appendChild(drawPreprints(t.preprints).node);
 
     // Model boxes + conclusion, laid out like the site
     var grid = el('div', 'grid');
@@ -312,7 +320,13 @@ details.turn[open] > summary .turn-q::after { content: ' · hide'; }
     if (a.fulltext) chip(a.fulltext + ' checked in full text', 'ok');
     if (a.unsourced && a.unsourced.checked) chip(a.unsourced.none_found + '/' + a.unsourced.checked + ' uncited claims unsupported', a.unsourced.none_found ? 'warn' : '');
     if (a.judge && a.judge.overall) chip('Judge ' + a.judge.overall + '/10');
+    if (a.truncated) chip('cut off', 'bad');
     box.appendChild(chips);
+
+    var body = el('div', 'mbody');
+    md(body, a.text);
+    if (a.truncated) body.appendChild(el('p', 'failed', '… The answer stops here: it hit the length limit, so its end (often the citations) is missing.'));
+    box.appendChild(body);
 
     var serious = a.flagged.filter(function (f) { return f.kind !== 'unchecked'; });
     if (serious.length) {
@@ -333,10 +347,6 @@ details.turn[open] > summary .turn-q::after { content: ' · hide'; }
       box.appendChild(flags);
     }
 
-    var body = el('div', 'mbody');
-    md(body, a.text);
-    box.appendChild(body);
-
     if (a.judge && a.judge.overall) {
       var j = el('div', 'mjudge');
       j.appendChild(el('b', null, 'Judge (' + a.judge.label + '): ' + a.judge.overall + '/10. '));
@@ -348,6 +358,43 @@ details.turn[open] > summary .turn-q::after { content: ' · hide'; }
     return box;
   }
 
+
+  function drawPreprints(scan) {
+    var pp = panel('Latest preprints (not peer-reviewed' + (scan.since ? ', since ' + scan.since : '') + ')', false,
+      'Found by OmniMed\'s own search of bioRxiv, medRxiv and other servers via Europe PMC, not by the models, which answered from peer-reviewed papers. The conclusion refers to them by ID.');
+    var tb = pp.table, papers = scan.preprints || {};
+    var groups = Object.keys(scan.by_candidate || {}).map(function (k) { return [k, scan.by_candidate[k], false]; })
+      .concat((scan.new || []).map(function (n) { return [n.name, n.ids || [], true]; }));
+    if (scan.unavailable) {
+      tb.appendChild(el('caption', 'empty', 'The preprint search (Europe PMC) did not respond, so this is unknown, not empty.'));
+      return pp;
+    }
+    if (!groups.length) {
+      tb.appendChild(el('caption', 'empty', 'No recent preprints on these candidates.'));
+      return pp;
+    }
+    row(tb, ['ID', 'Candidate', 'Preprint', 'Server', 'Posted', 'Since published'], true);
+    groups.forEach(function (g) {
+      g[1].forEach(function (id) {
+        var p = papers[id]; if (!p) return;
+        var x = p.extra || {}, tr = el('tr');
+        tr.appendChild(el('td', null, id));
+        tr.appendChild(el('td', null, g[0] + (g[2] ? ' (no model named it)' : '')));
+        var td = el('td'), a = el('a', null, p.title || p.doi);
+        a.href = p.url; a.target = '_blank'; a.rel = 'noopener noreferrer'; td.appendChild(a); tr.appendChild(td);
+        tr.appendChild(el('td', null, p.journal || 'Preprint'));
+        tr.appendChild(el('td', null, x.posted || p.year || ''));
+        var pub = el('td');
+        if (x.published_as) {
+          var b = el('a', null, x.published_as.ref || 'journal version');
+          b.href = x.published_as.url; b.target = '_blank'; b.rel = 'noopener noreferrer'; pub.appendChild(b);
+        } else pub.textContent = '—';
+        tr.appendChild(pub);
+        tb.appendChild(tr);
+      });
+    });
+    return pp;
+  }
 
   function drawConclusion(verdict) {
     var concl = el('section', 'mbox conclusion');

@@ -20,11 +20,13 @@
 
 import os
 import re
+import difflib
 import time
 import asyncio
 import hashlib
 import threading
 from dataclasses import dataclass, field, asdict
+from datetime import date
 
 import httpx
 
@@ -148,7 +150,10 @@ async def search_europepmc(client: httpx.AsyncClient, query: str,
                            limit: int = MAX_RESULTS_DEFAULT,
                            year_from: int | None = None,
                            year_to: int | None = None) -> list[Paper]:
-    q = query
+    # Peer-reviewed only. Europe PMC also indexes preprints, and a model handed
+    # one could not tell it from a journal paper. Preprints go to the
+    # conclusion instead, labelled (see search_preprints).
+    q = f"({query}) NOT SRC:PPR"
     if year_from or year_to:
         q += f" AND (FIRST_PDATE:[{year_from or 1900} TO {year_to or 3000}])"
     # Errors propagate: search() records the source as unavailable, which an
@@ -548,7 +553,10 @@ LNC_RE = re.compile(r"\b(" + "|".join(sorted(LNCRNA_NAMES, key=len, reverse=True
 # that shape but are not genes — without it "RNA", "PCR" and "LV" matched.
 # The trailing [a-z]? matters: SERCA2a, NFkB and Kir2.1 are written with a
 # lower-case tail, and requiring all-caps silently skipped every one of them.
-GENE_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,7}[a-z]?(?:-[A-Z0-9]{1,3})?)\b")
+# At least three characters: two-letter capitals are initials and units far
+# more often than genes ("NG", "RL", "KJ"), and each one read as a gene
+# turned an unrelated paper into a confident "off-topic" verdict.
+GENE_RE = re.compile(r"\b([A-Z][A-Z0-9]{2,7}[a-z]?(?:-[A-Z0-9]{1,3})?)\b")
 NOT_GENES = {
     "RNA", "DNA", "MRNA", "MIRNA", "LNCRNA", "SIRNA", "PCR", "QPCR", "RTPCR",
     "CDNA", "UTR", "SNP", "KO", "WT", "LV", "RV", "EF", "LVEF", "HF", "HFREF",
@@ -570,6 +578,16 @@ NOT_GENES = {
     "IPSCS", "HIPSC", "HIPSCS", "MSC", "MSCS", "BMSC", "BMSCS", "BM", "EV", "EVS",
     "EXO", "EXOS", "AC16", "H9C2", "HL-1", "HUVEC", "HUVECS", "HEK293", "NTA",
     "TEM",
+    # Molecule classes, not genes ("COVID-19 and RNAs" was matched as a gene).
+    "RNA", "RNAS", "DNA", "MIRNA", "MIRNAS", "LNCRNA", "LNCRNAS", "NCRNA", "NCRNAS",
+    "CIRCRNA", "CIRCRNAS", "MRNA", "MRNAS", "COVID", "COVID-19", "SARS-COV-2", "HIV",
+    # Study, method and population words seen matched as genes in real answers
+    # (a paper "concerns LGBTQ" was offered as the reason a citation was
+    # off-topic). The verdict then reads as a finding about genes that are not
+    # genes; without them the claim is reported as unchecked instead.
+    "LGBTQ", "WGS", "WES", "MDR", "SJS", "LOS", "NTS", "DCS", "TBARS", "SMPL",
+    "RCT", "RCTS", "ITT", "QOL", "BMI", "ICU", "ED", "OR", "RR", "HRQOL",
+    "SOP", "FAQ", "PDFS", "SUPPL", "FIG", "FIGS", "TABLE", "REF", "REFS",
 }
 
 
@@ -612,14 +630,26 @@ def _rna_entities(text: str) -> set[str]:
 
 
 HEADING_RE = re.compile(r"^\s*(?:#{1,6}\s+.+|\*\*[^*\n]+\*\*:?)\s*$")
+# A candidate's title line: optional number, then a short label that is bold
+# or plain, not a "Field: value" bullet ("1. **miR-21 — miRNA**", "miR-21 — miRNA").
+CANDIDATE_LINE_RE = re.compile(r"^(?:\d+[.)]\s+)?(?:\*\*[^*\n]{2,100}\*\*|[^-*•:\n][^:\n]{1,80})\s*$")
+_ITEM_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s")
+HEADING_LOOKBACK = 25                  # lines; a candidate block is rarely longer
 
 
 def _section_heading(text: str, pos: int) -> str:
-    """The nearest heading line before pos: a markdown '#' heading or a line
-    that is bold on its own ("**1. miR-9-5p (miRNA)**"). Empty if none."""
-    for line in reversed(text[:max(pos, 0)].splitlines()):
-        if HEADING_RE.match(line):
-            return line.strip()
+    """The title of the candidate a list item sits under: the nearest '#'
+    heading, bold-only line, or short title line naming an RNA. Empty if none
+    within HEADING_LOOKBACK lines."""
+    for line in list(reversed(text[:max(pos, 0)].splitlines()))[:HEADING_LOOKBACK]:
+        bare = line.strip()
+        if not bare:
+            continue
+        if HEADING_RE.match(bare):
+            return bare
+        if CANDIDATE_LINE_RE.match(bare) and _rna_entities(bare) and not \
+                (_ITEM_RE.match(line) and ":" in bare):
+            return bare
     return ""
 
 
@@ -643,6 +673,15 @@ def _claim_context(text: str, marker: str, window: int = 400) -> str:
         end = len(text)
     block = text[start:end].strip()
 
+    # A detail bullet under a candidate ("1. **miR-21**" then "- Synergy:
+    # complements miR-29 … [PMID]") is about that candidate even when it names
+    # another RNA. Without the title, a correct miR-21 paper cited on that line
+    # was checked against miR-29 alone and reported as off-topic.
+    if re.match(r"^(?:[-*•]|\d+[.)])\s", block):
+        heading = _section_heading(text, start)
+        if heading and heading not in block and _rna_entities(heading):
+            return f"{heading}\n{block}"
+
     if _rna_entities(block):
         return block
 
@@ -652,13 +691,6 @@ def _claim_context(text: str, marker: str, window: int = 400) -> str:
     # would borrow the previous bullet's miRNA and report a mismatch against a
     # claim the citation was never attached to. Better to report nothing.
     if re.match(r"^(?:[-*•]|\d+[.)])\s", block):
-        # ...unless the list sits under a heading naming the candidate
-        # ("#### miR-495-3p" then "- **Cell lines studied**: … [PMID]"). The
-        # heading scopes every bullet below it, so it is the claim's subject;
-        # without it the bullet was matched on stray acronyms instead.
-        heading = _section_heading(text, start)
-        if _rna_entities(heading):
-            return f"{heading}\n{block}"
         return block
     return text[max(0, i - window): end]
 
@@ -760,8 +792,10 @@ FULLTEXT_CHECKS = 8                    # flagged citations re-checked per answer
 # so clients holding a saved result from an older checker re-run it instead of
 # showing a stale verdict. 2 = full-text second look, topic-checked Crossref
 # fallback, author-name fixes; 3 = NCBI PubMed Central as a second source;
-# 4 = candidate heading as claim context, disease/cell-line acronyms not genes.
-CHECKER_VERSION = 4
+# 4 = candidate heading as claim context, disease/cell-line acronyms not genes;
+# 5 = candidate title lines ("1. **miR-21 — miRNA**") count, for every bullet;
+# 6 = a DOI citation is checked against its PubMed abstract, not its title alone.
+CHECKER_VERSION = 8
 FULLTEXT_MAX_CHARS = 600_000
 
 
@@ -907,6 +941,176 @@ def extract_narrative_citations(text: str) -> list[dict]:
             "journal": re.sub(r"\s+", " ", journal).strip()[:60],
             "raw": m.group(0).strip(),
         })
+    return out
+
+
+# ── Reference lists ────────────────────────────────────────────────────────
+#
+# A model given a papers list cites them as "[4]" and puts the full reference
+# at the end. Neither form carries a PMID, so the identifier and author-year
+# extractors both found nothing and the answer was reported as "No citations" —
+# the most careful citer in a run scored the same as one that cited nothing.
+# The entry's title is the strongest key there is: PubMed's [ti] field pins the
+# record far more reliably than author+year, which needs the journal to
+# disambiguate.
+REF_ENTRY_RE = re.compile(r"^[ \t]*\[?(\d{1,3})[\].)]\s+(\S.*)$", re.M)
+# A reference needs a year to be worth looking up; without one it is prose.
+REF_YEAR_RE = re.compile(r"\b((?:19|20)\d{2})\b")
+MIN_REF_TITLE_CHARS = 25
+MAX_REFERENCES = 25
+
+
+def _ref_title(entry: str) -> str:
+    """The title inside a reference entry: its longest sentence-like span.
+
+    Entries vary ("Authors. Title. Journal. Year;vol:pages", with or without
+    italics), but across all of them the title is the longest run between full
+    stops — authors, journal, volume and pages are all short.
+    """
+    body = re.sub(r"[*_`]", "", entry)
+    body = REF_YEAR_RE.split(body)[0] or body        # drop journal/volume tail
+    parts = [p.strip(" .,;:") for p in re.split(r"(?<=[a-z0-9\"'])\.\s+", body)]
+    parts = [p for p in parts if not re.match(r"^[A-Z][a-zA-Z'\- ]{0,24}(,|\s)", p) or len(p) > 40]
+    best = max(parts, key=len, default="")
+    return re.sub(r"\s+", " ", best).strip()
+
+
+def extract_reference_list(text: str) -> list[dict]:
+    """Numbered reference entries, each with its title and first author."""
+    out, seen = [], set()
+    for m in REF_ENTRY_RE.finditer(text or ""):
+        num, entry = m.group(1), m.group(2).strip()
+        years = REF_YEAR_RE.findall(entry)
+        if not years:
+            continue                       # a numbered list item, not a reference
+        title = _ref_title(entry)
+        if len(title) < MIN_REF_TITLE_CHARS:
+            continue
+        key = title.lower()[:60]
+        if key in seen:
+            continue
+        seen.add(key)
+        am = re.match(rf"({_SURNAME})", entry)
+        author = am.group(1) if am else ""
+        out.append({"num": num, "title": title, "year": years[-1],
+                    "author": author, "journal": "", "raw": entry[:200]})
+    return out
+
+
+# Words that carry no signal in a title search; dropping them leaves the terms
+# that actually pin the record.
+_TITLE_STOP = {
+    "the", "and", "for", "with", "from", "via", "that", "this", "was", "are",
+    "its", "into", "not", "but", "role", "study", "studies", "effects", "effect",
+    "novel", "using", "after", "their", "have", "has", "can", "may", "new",
+    "results", "analysis", "evidence", "review", "report", "case", "among",
+}
+# How close a found title must be to the cited one. Below this the record is
+# someone else's paper, and resolving to it would be worse than not resolving.
+TITLE_MATCH_MIN = 0.80
+TITLE_SEARCH_WORDS = 6
+
+
+def _title_keywords(title: str) -> list[str]:
+    """The most distinctive words of a title, longest first.
+
+    ANDing every word in [ti] matched nothing for most real titles: PubMed
+    indexes hyphenated and greek-letter terms unpredictably, and one odd token
+    empties the result. Six long words are specific enough to find the paper
+    and forgiving enough to survive those differences.
+    """
+    words = [w for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]{2,}", title or "")
+             if w.lower() not in _TITLE_STOP]
+    seen, out = set(), []
+    for w in sorted(words, key=len, reverse=True):
+        if w.lower() in seen:
+            continue
+        seen.add(w.lower())
+        out.append(w)
+    return out[:TITLE_SEARCH_WORDS]
+
+
+def _title_similarity(a: str, b: str) -> float:
+    norm = lambda t: re.sub(r"[^a-z0-9 ]", " ", (t or "").lower()).strip()
+    return difflib.SequenceMatcher(None, norm(a), norm(b)).ratio()
+
+
+async def _pubmed_by_title(client: httpx.AsyncClient, title: str) -> tuple[dict | None, float]:
+    """Find a paper by its title, with how closely the title matched.
+
+    The caller decides what to do with a weak match; returning the score rather
+    than a bare paper keeps "found someone else's paper" distinguishable from
+    "found the paper", which is the difference between a false accusation and
+    a correct one.
+    """
+    kw = _title_keywords(title)
+    if len(kw) < 3:
+        return None, 0.0
+    term = " AND ".join(f"{w}[ti]" for w in kw)
+    await _ncbi_limiter.wait()
+    r = await client.get(f"{EUTILS}/esearch.fcgi", params=_ncbi_params(
+        db="pubmed", term=term, retmode="json", retmax=5))
+    r.raise_for_status()
+    ids = r.json().get("esearchresult", {}).get("idlist", []) or []
+    if not ids:
+        return None, 0.0
+    await _ncbi_limiter.wait()
+    r2 = await client.get(f"{EUTILS}/efetch.fcgi", params=_ncbi_params(
+        db="pubmed", id=",".join(ids), retmode="xml"))
+    r2.raise_for_status()
+    best, score = None, 0.0
+    for p in _parse_pubmed_xml(r2.text):
+        sc = _title_similarity(title, p.title)
+        if sc > score:
+            best, score = p, sc
+    return (best.to_dict() if best else None), score
+
+
+async def resolve_reference(client: httpx.AsyncClient, ref: dict,
+                            claim_context: str = "") -> dict:
+    """Resolve a numbered reference to a real paper, by title then author+year."""
+    key = _cache_key("ref1", ref["title"].lower()[:80], ref["year"])
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    out = {"type": "reference", "id": f"[{ref['num']}]",
+           "author": ref.get("author", ""), "year": ref["year"],
+           "cited_title": ref["title"][:160]}
+    try:
+        paper, score = await _pubmed_by_title(client, ref["title"])
+    except Exception:
+        out.update({"exists": None, "error": "LOOKUP_FAILED"})
+        return out                                   # transient — do not cache
+    level = f"title {score:.2f}"
+    if score < TITLE_MATCH_MIN:
+        paper = None
+    # Author and year alone resolved a reference to an unrelated paper by the
+    # same author (a miR-132 inhibitor paper matched to a lncRNA vesicle one),
+    # so the fallback has to clear the same title bar before it is accepted.
+    if not paper and ref.get("author"):
+        cand, lvl = await _pubmed_narrative(
+            client, {"author": ref["author"], "year": ref["year"], "journal": ""},
+            _rna_entities(claim_context))
+        if lvl == "LOOKUP_FAILED":
+            out.update({"exists": None, "error": "LOOKUP_FAILED"})
+            return out
+        if cand and _title_similarity(ref["title"], cand.get("title", "")) >= TITLE_MATCH_MIN:
+            paper, level = cand, lvl
+    if paper:
+        out.update({"exists": True, "title": paper["title"], "journal": paper["journal"],
+                    "year": paper["year"] or ref["year"], "abstract": paper["abstract"],
+                    "pmid": paper["pmid"], "doi": paper["doi"], "url": paper["url"],
+                    "mesh": (paper.get("extra") or {}).get("mesh") or [],
+                    "retracted": bool((paper.get("extra") or {}).get("retracted")),
+                    "match": level})
+        _cache_put(key, out)
+        return out
+    # A title that matches nothing is a strong fabrication signal, but PubMed
+    # does not index everything (books, some conference papers), so this is
+    # reported for a human rather than counted as invented.
+    out.update({"exists": None, "error": "UNCONFIRMED",
+                "reason": "no PubMed record with this title, or by this author in this year"})
+    _cache_put(key, out)
     return out
 
 
@@ -1414,10 +1618,234 @@ async def profile_candidates(answers: dict, context: str = "") -> list[dict]:
     return out
 
 
+# ── Preprints ──────────────────────────────────────────────────────────────
+#
+# The models answer from peer-reviewed papers and their own training, so they
+# cannot know what was posted in the last year or two. The conclusion looks
+# that up: for each candidate the models named, the latest bioRxiv / medRxiv
+# preprints that mention it, and microRNAs that recent preprints on the topic
+# study but no model named. Preprints are not peer-reviewed; every one carries
+# that label wherever it is shown, and none is ever handed to a model as a
+# source for its answer.
+#
+# Every preprint comes from this search, never from a model, so none can be
+# fabricated: the conclusion refers to them by id (P1, P2…) and the metadata
+# shown to the reader is ours.
+
+PREPRINT_MONTHS = 24
+PREPRINTS_PER_CANDIDATE = 3
+PREPRINT_CANDIDATES = 8           # candidates searched; each is one Europe PMC call
+PREPRINT_DISCOVERY_POOL = 25
+MAX_NEW_CANDIDATES = 4
+PREPRINT_ABSTRACT_CHARS = 6_000      # whole: the relevance check reads all of it
+PREPRINT_TOPIC_TERMS = 2          # all of these must be in the title or abstract
+
+
+def _preprint_server(it: dict) -> str:
+    pub = ((it.get("bookOrReportDetails") or {}).get("publisher") or "").strip()
+    if pub:
+        return pub
+    doi = (it.get("doi") or "").lower()
+    return "bioRxiv / medRxiv" if doi.startswith("10.1101/") else "Preprint"
+
+
+def _published_version(it: dict) -> dict | None:
+    """The journal version of a preprint, when Europe PMC has linked one."""
+    rel = ((it.get("commentCorrectionList") or {}).get("commentCorrection") or [])
+    for c in rel if isinstance(rel, list) else [rel]:
+        if not isinstance(c, dict):
+            continue
+        kind = (c.get("type") or "").lower()
+        if "preprint" in kind and c.get("source") in ("MED", "PMC") and c.get("id"):
+            pmid = c["id"] if c.get("source") == "MED" else ""
+            return {"pmid": pmid, "ref": _clean(c.get("reference") or "", 200),
+                    "url": (f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid
+                            else f"https://europepmc.org/article/{c['source']}/{c['id']}")}
+    return None
+
+
+async def search_preprints(client: httpx.AsyncClient, query: str,
+                           limit: int = PREPRINTS_PER_CANDIDATE,
+                           months: int = PREPRINT_MONTHS) -> list[Paper]:
+    """Recent preprints (bioRxiv, medRxiv, Research Square…) via Europe PMC."""
+    since = date.fromordinal(max(1, date.today().toordinal() - months * 30)).isoformat()
+    r = await client.get(f"{EUROPEPMC}/search", params={
+        "query": f"({query}) AND SRC:PPR AND FIRST_PDATE:[{since} TO 3000-12-31]",
+        "format": "json", "pageSize": min(limit, 25), "resultType": "core",
+    })
+    r.raise_for_status()
+    out = []
+    for it in (r.json().get("resultList", {}).get("result", []) or [])[:limit]:
+        doi = it.get("doi", "") or ""
+        ppr = it.get("id", "") or ""
+        authors = [a.get("lastName", "") for a in
+                   (it.get("authorList", {}) or {}).get("author", [])[:6] if a.get("lastName")]
+        out.append(Paper(
+            source="preprint",
+            title=_clean(it.get("title", ""), 400),
+            abstract=_clean(it.get("abstractText", ""), PREPRINT_ABSTRACT_CHARS),
+            journal=_preprint_server(it),
+            year=str(it.get("pubYear", "") or ""),
+            authors=authors, doi=doi,
+            url=(f"https://doi.org/{doi}" if doi
+                 else f"https://europepmc.org/article/PPR/{ppr}" if ppr else ""),
+            is_open_access=True,
+            extra={"posted": it.get("firstPublicationDate", ""), "ppr_id": ppr,
+                   "published_as": _published_version(it)},
+        ))
+    return out
+
+
+def _title_abs(term: str) -> str:
+    # Title and abstract only: searched in full text, "miR-21 AND doxorubicin"
+    # returned a breast-cancer paper that mentions both once in its methods.
+    return f"TITLE_ABS:({term})"
+
+
+def _about(p: Paper, ent: str | None, topic: list) -> bool:
+    """Is this preprint about the candidate and the topic, not merely near them?
+
+    Checked here as well as in the query, since the index's matching is
+    looser than it looks (stemming, synonyms): every topic term (by its first
+    six letters, so "cardiotoxic" matches "cardiotoxicity") and, for a
+    candidate, its family must appear in the title or abstract.
+    """
+    text = normalize_text(f"{p.title} {p.abstract}")
+    low = text.lower()
+    if any(t.lower()[:6] not in low for t in topic):
+        return False
+    if ent is None:
+        return True
+    fam = _mir_family(ent) if ent.startswith(("mir-", "let-")) else ent
+    return any(e == ent or _mir_family(e) == fam for e in _rna_entities(text))
+
+
+async def scan_preprints(candidates: list, topic: list) -> dict:
+    """Latest preprints on each candidate, and RNAs only preprints mention.
+
+    `candidates` are entity keys (as in profile_candidates); `topic` is the
+    question's search terms without the RNA names (disease, tissue, drug).
+    Returns {"preprints": {id: paper}, "by_candidate": {name: [ids]},
+    "new": [{"name", "ids"}], "since", "unavailable"}; ids are P1, P2…
+    """
+    topic = [t for t in (topic or []) if t and not _rna_entities(t)][:PREPRINT_TOPIC_TERMS]
+    # Every candidate a model named counts as "known" for the discovery check
+    # below, but only the first few get a search of their own. Truncating both
+    # together reported a candidate ranked 9th or lower as named by no model.
+    named = list(dict.fromkeys(candidates or []))
+    candidates = named[:PREPRINT_CANDIDATES]
+    since = date.fromordinal(date.today().toordinal() - PREPRINT_MONTHS * 30).isoformat()
+    result = {"preprints": {}, "by_candidate": {}, "new": [], "since": since,
+              "unavailable": False, "topic": topic}
+    if not topic and not candidates:
+        return result
+
+    key = _cache_key("preprints", tuple(sorted(named)), tuple(topic))
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+
+    # Every topic term, ANDed: "doxorubicin OR cardiotoxicity" returned
+    # doxorubicin papers about cancer. The question's terms come most central
+    # first (disease and tissue before the rest), so the first two carry it.
+    ctx = " AND ".join(_title_abs(f'"{t}"' if " " in t else t) for t in topic)
+    failures = 0
+
+    async with httpx.AsyncClient(timeout=TIMEOUT,
+                                 headers={"User-Agent": f"{NCBI_TOOL} (biomedical research)"}) as client:
+        async def per_candidate(ent):
+            q = _title_abs(_entity_query(ent)) + (f" AND {ctx}" if ctx else "")
+            # A few spare, since the check below drops what is only nearby.
+            found = await search_preprints(client, q, PREPRINTS_PER_CANDIDATE * 2)
+            return [p for p in found if _about(p, ent, topic)][:PREPRINTS_PER_CANDIDATE]
+
+        async def discovery():
+            group = _title_abs('microRNA OR miRNA OR "miR" OR lncRNA OR circRNA OR "non-coding RNA"')
+            found = await search_preprints(client, f"{group} AND {ctx}", PREPRINT_DISCOVERY_POOL)
+            return [p for p in found if _about(p, None, topic)]
+
+        settled = await asyncio.gather(*[per_candidate(e) for e in candidates],
+                                       discovery() if topic else asyncio.sleep(0, []),
+                                       return_exceptions=True)
+
+    ids: dict[str, str] = {}
+
+    def add(p: Paper) -> str:
+        ident = p.doi.lower() or p.extra.get("ppr_id") or p.title.lower()[:80]
+        if ident not in ids:
+            ids[ident] = f"P{len(ids) + 1}"
+            result["preprints"][ids[ident]] = p.to_dict()
+        return ids[ident]
+
+    for ent, res in zip(candidates, settled[:-1]):
+        if not isinstance(res, list):
+            failures += 1
+            continue
+        if res:
+            result["by_candidate"][_display_name(ent)] = [add(p) for p in res]
+
+    pool = settled[-1]
+    if isinstance(pool, list):
+        # RNAs the recent preprints study that no model named. Compared by
+        # family, so a preprint on miR-210-3p is not "new" when a model said miR-210.
+        known = {_mir_family(e) for e in named} | set(named)
+        mentions: dict[str, list] = {}
+        for p in pool:
+            for ent in _rna_entities(normalize_text(f"{p.title} {p.abstract}")):
+                if ent in known or _mir_family(ent) in known:
+                    continue
+                group = mentions.setdefault(
+                    _mir_family(ent) if ent.startswith(("mir-", "let-")) else ent, [])
+                if p not in group:          # miR-200a, b and c: one paper, once
+                    group.append(p)
+        ranked = sorted(mentions.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:MAX_NEW_CANDIDATES]
+        result["new"] = [{"name": _display_name(ent),
+                          "ids": [add(p) for p in ps[:PREPRINTS_PER_CANDIDATE]]}
+                         for ent, ps in ranked]
+    elif topic:
+        failures += 1
+
+    # Europe PMC down is "unavailable", never "no preprints"; and not cached.
+    result["unavailable"] = failures > 0 and not result["preprints"]
+    result["incomplete"] = failures > 0
+    if not failures:
+        _cache_put(key, result)
+    return result
+
+
 # Per answer. Real answers cite well under 20 papers; the cap bounds the
 # Crossref/PubMed calls one request can trigger (DOIs are checked concurrently).
 MAX_CITATIONS = 40
 MAX_NARRATIVE_CITATIONS = 15
+
+
+async def _pubmed_by_doi(client: httpx.AsyncClient, dois: list) -> dict:
+    """PubMed records for these DOIs, by lower-case DOI. Two calls in all."""
+    await _ncbi_limiter.wait()
+    r = await client.get(f"{EUTILS}/esearch.fcgi", params=_ncbi_params(
+        db="pubmed", term=" OR ".join(f'"{d}"[doi]' for d in dois), retmode="json",
+        retmax=len(dois) * 2))
+    r.raise_for_status()
+    ids = r.json().get("esearchresult", {}).get("idlist", []) or []
+    if not ids:
+        return {}
+    await _ncbi_limiter.wait()
+    r2 = await client.get(f"{EUTILS}/efetch.fcgi", params=_ncbi_params(
+        db="pubmed", id=",".join(ids), retmode="xml"))
+    r2.raise_for_status()
+    return {p.doi.lower(): p.to_dict() for p in _parse_pubmed_xml(r2.text) if p.doi}
+
+
+def _reference_body(text: str) -> str:
+    """The answer with its reference list removed.
+
+    The claim behind "[4]" is where [4] is used in the prose, not the reference
+    entry that defines it; searching the whole text finds the entry first.
+    """
+    ms = list(REF_ENTRY_RE.finditer(text or ""))
+    if len(ms) < 2:
+        return text
+    return text[:ms[0].start()]
 
 
 async def verify_citations(text: str) -> dict:
@@ -1431,12 +1859,14 @@ async def verify_citations(text: str) -> dict:
     text = normalize_text(text)
     found = extract_citations(text)
     narrative = extract_narrative_citations(text)
+    references = extract_reference_list(text)[:MAX_REFERENCES]
     truncated = (len(found["pmids"]) > MAX_CITATIONS or len(found["dois"]) > MAX_CITATIONS
-                 or len(narrative) > MAX_NARRATIVE_CITATIONS)
+                 or len(narrative) > MAX_NARRATIVE_CITATIONS
+                 or len(extract_reference_list(text)) > MAX_REFERENCES)
     found = {"pmids": found["pmids"][:MAX_CITATIONS], "dois": found["dois"][:MAX_CITATIONS]}
     narrative = narrative[:MAX_NARRATIVE_CITATIONS]
     ids = found["pmids"] + found["dois"]
-    if not ids and not narrative:
+    if not ids and not narrative and not references:
         return {"checked": 0, "verified": 0, "fabricated": 0, "unresolved": 0,
                 "mismatched": 0, "hallucination_rate": None,
                 "miscitation_rate": None, "citations": [],
@@ -1497,6 +1927,26 @@ async def verify_citations(text: str) -> dict:
                 continue
             cites.append(r)
 
+        # Crossref gives a DOI's title but no abstract, and a title alone is too
+        # little to judge a claim: a real DOI for an inclisiran trial, cited for
+        # a miR-132 drug, came back "real" and passed. PubMed indexes most of
+        # these papers by DOI; one search fetches their abstracts.
+        bare = [c for c in cites if c.get("type") == "doi" and c.get("exists")
+                and not c.get("abstract")]
+        if bare:
+            try:
+                found_by_doi = await _pubmed_by_doi(client, [c["id"] for c in bare])
+            except Exception:
+                found_by_doi = {}
+            for c in bare:
+                rec = found_by_doi.get(c["id"].lower())
+                if rec:
+                    c["abstract"] = rec["abstract"]
+                    c["mesh"] = (rec.get("extra") or {}).get("mesh") or []
+                    c["pmid"] = rec.get("pmid")
+                    if (rec.get("extra") or {}).get("retracted"):
+                        c["retracted"] = True
+
         # Author-year citations. Dropped when they resolve to a paper already
         # cited by identifier, so "miR-21 (Thum et al. 2008, PMID:19043405)"
         # counts once rather than twice.
@@ -1515,12 +1965,31 @@ async def verify_citations(text: str) -> dict:
             seen |= keys
             cites.append(nr)
 
+        # Numbered reference entries. Resolved last, so a paper already matched
+        # by PMID, DOI or author-year is not counted a second time.
+        body = _reference_body(text)
+        ref_results = await asyncio.gather(
+            *[resolve_reference(client, rf, _claim_context(body, f"[{rf['num']}]"))
+              for rf in references], return_exceptions=True)
+        for rr in ref_results:
+            if not isinstance(rr, dict):
+                continue
+            keys = {(rr.get("title") or "").lower()[:60], (rr.get("pmid") or "").lower(),
+                    (rr.get("doi") or "").lower()} - {""}
+            if keys & seen:
+                continue
+            seen |= keys
+            cites.append(rr)
+
     # Second tier: for citations that do exist, does the paper actually concern
     # the claim it was attached to?
     flagged = []
+    body = _reference_body(text)
     for c in cites:
         if c.get("exists") is True:
-            ctx = _claim_context(text, c["id"])
+            # A reference's claim is where "[4]" is used in the prose; the
+            # reference entry itself is only where the paper is named.
+            ctx = _claim_context(body if c.get("type") == "reference" else text, c["id"])
             c["support"] = assess_citation_support(ctx, c)
             if c["support"]["support"] in ("mismatched", "unrelated"):
                 flagged.append((c, ctx))

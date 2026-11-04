@@ -87,10 +87,18 @@ COUNCIL_SYSTEM = (
     '{"headline":"one sentence, the answer itself",'
     '"summary":"2-3 sentences of context",'
     '"candidates":[{"name":"e.g. miR-132","models":N,"confidence":"high|moderate|low",'
-    '"why":"one short sentence","caveat":"one short sentence or empty"}],'
+    '"why":"one short sentence","caveat":"one short sentence or empty",'
+    '"test":"the first experiment to run: mimic or inhibitor, model system, readout"}],'
+    '"preprints":[{"id":"P1","candidate":"e.g. miR-132","stance":"supports|contradicts|new|unclear",'
+    '"note":"one short sentence on what it found"}],'
     '"disagreements":["short statement of a real conflict"],'
     '"caveats":["short limitation a researcher should know"]}\n'
     "`models` is how many of the answers proposed that candidate.\n"
+    "- `test` is concrete and grounded in the answers or the evidence below. "
+    "Write it as a suggestion; nothing here has been validated.\n"
+    "- `preprints` covers only the preprints listed below, by their id. They "
+    "are NOT peer-reviewed: they may change your caveats, but never raise a "
+    "candidate's confidence on their own. Omit the field if none are listed.\n"
     "- Include EVERY candidate listed in the independent evidence section, up "
     "to 8. Do not silently drop one because only a single answer named it — a "
     "candidate one model found and the others missed is worth reporting, "
@@ -133,10 +141,41 @@ def _candidate_table(profiles: list | None) -> str:
             "to outrank one that more answers happened to mention.")
 
 
+def _preprint_section(scan: dict | None) -> str:
+    """The latest preprints on the candidates, from our own search.
+
+    Listed by id so the verdict can point at them without writing a reference
+    itself; the reader sees our metadata for each id, never the model's.
+    """
+    if not scan or not scan.get("preprints"):
+        return ""
+    papers = scan["preprints"]
+    lines = []
+
+    def entry(pid):
+        p = papers.get(pid) or {}
+        return (f"  [{pid}] {p.get('title', '')} ({p.get('journal', 'preprint')}, "
+                f"posted {(p.get('extra') or {}).get('posted') or p.get('year', '')})\n"
+                f"       {_shorten(p.get('abstract', ''), 700)}")
+
+    for name, ids in (scan.get("by_candidate") or {}).items():
+        lines.append(f"- On {name}:")
+        lines += [entry(i) for i in ids]
+    for n in scan.get("new") or []:
+        lines.append(f"- {n['name']} (named by NO answer; found only in recent preprints):")
+        lines += [entry(i) for i in n.get("ids", [])]
+
+    return ("\n\nLATEST PREPRINTS (posted since " + str(scan.get("since", ""))
+            + "; NOT peer-reviewed; found by OmniMed, not by the answers). For each, "
+            "say whether it supports or contradicts a candidate, or introduces a new one:\n"
+            + "\n".join(lines))
+
+
 def build_council_prompt(question: str, answers: dict,
                          verifications: dict | None = None,
                          focus: str | None = None,
-                         profiles: list | None = None) -> str:
+                         profiles: list | None = None,
+                         preprints: dict | None = None) -> str:
     """Assemble every model's answer, each tagged with its own citation record.
 
     Answers are labelled by index rather than by model name. The council should
@@ -157,7 +196,8 @@ def build_council_prompt(question: str, answers: dict,
                       f"{_shorten(answer, MAX_COUNCIL_ANSWER_CHARS)}\n</answer>")
 
     out = (f"QUESTION:\n{_shorten(question, MAX_QUESTION_CHARS)}\n\n"
-           + "\n\n".join(blocks) + _candidate_table(profiles))
+           + "\n\n".join(blocks) + _candidate_table(profiles)
+           + _preprint_section(preprints))
     if focus:
         out += ("\n\nThe reader also asked: " + _shorten(focus, 400)
                 + "\nAnswer that in `summary`, using only what the answers above contain.")
@@ -190,7 +230,20 @@ def parse_council_reply(text: str) -> dict | None:
             "confidence": conf if conf in ("high", "moderate", "low") else "moderate",
             "why": _str(c.get("why"), 240),
             "caveat": _str(c.get("caveat"), 240),
+            "test": _str(c.get("test"), 300),
         })
+
+    notes = []
+    for n in (obj.get("preprints") or [])[:12]:
+        if not isinstance(n, dict):
+            continue
+        pid = _str(n.get("id"), 8).upper()
+        stance = str(n.get("stance") or "").lower()
+        if not re.fullmatch(r"P\d{1,3}", pid):
+            continue
+        notes.append({"id": pid, "candidate": _str(n.get("candidate"), 60),
+                      "stance": stance if stance in ("supports", "contradicts", "new") else "unclear",
+                      "note": _str(n.get("note"), 300)})
 
     def _list(key, limit, n):
         raw = obj.get(key)
@@ -202,6 +255,7 @@ def parse_council_reply(text: str) -> dict | None:
         "headline": _str(obj.get("headline"), 400),
         "summary": _str(obj.get("summary"), 900),
         "candidates": cands,
+        "preprints": notes,
         "disagreements": _list("disagreements", 300, 3),
         "caveats": _list("caveats", 300, 3),
     }
